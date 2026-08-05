@@ -235,11 +235,12 @@ def compute_safety_returns(safety_values, dones, alpha, clamp_max=0.5,
 
     clamped at `clamp_max`.  `safety_values` and `dones` are [T, B].
 
-    NOTE on alpha: the shipped `rollout_storage.py` uses 0.7, its own
-    docstring says 0.95/0.05, and Table 4 says 0.80.  That is
-    viploco_codebase_addendum.md §2's open reconciliation item.  We take it as
-    a parameter and record the value used in the Q-hat report, so E1 is
-    reproducible whichever way the reconciliation lands.
+    NOTE on alpha: three sources in the repo disagree -- the shipped
+    `rollout_storage.py` body uses 0.7, its own docstring says 0.95/0.05, and
+    Table 4 says 0.80 (viploco_codebase_addendum.md §2's open reconciliation
+    item).  **0.95 is the value chosen for E1**, matching the docstring.  It is
+    a parameter either way and the value used is recorded in the Q-hat report,
+    so E1 stays reproducible whichever way the reconciliation finally lands.
     """
     T = safety_values.shape[0]
     out = torch.zeros_like(safety_values)

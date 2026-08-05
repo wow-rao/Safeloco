@@ -57,11 +57,11 @@ def parse_args():
     p.add_argument("--buffers", nargs="+", required=True,
                    help="paths written by collect_qsafe_data.py, without .pt")
     p.add_argument("--out", type=str, default="logs/e1/qsafe")
-    p.add_argument("--alpha", type=float, default=0.7,
-                   help="safety-return discount. The shipped "
-                        "rollout_storage.py uses 0.7, its docstring says 0.95 "
-                        "and Table 4 says 0.80 -- addendum §2's open "
-                        "reconciliation item. Recorded in the report.")
+    p.add_argument("--alpha", type=float, default=0.95,
+                   help="safety-return discount. Three sources disagree: the "
+                        "shipped rollout_storage.py body uses 0.7, its own "
+                        "docstring says 0.95, Table 4 says 0.80 (addendum §2). "
+                        "0.95 chosen; recorded in the report.")
     p.add_argument("--val_frac", type=float, default=0.2)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch", type=int, default=4096)

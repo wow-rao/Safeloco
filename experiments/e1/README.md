@@ -45,13 +45,14 @@ not at all. Behaviour is otherwise unchanged.
 python tests/test_e1_offline.py
 ```
 
-**1. Train π_nom.** With no surviving runs this is step one, and it is the
-single biggest cost in Phase 1 — roughly a GPU-day on top of the protocol's
-2–3 day estimate, which assumed π_nom already existed.
+**1. Train π_nom.** With no surviving runs this is step one. It is extra cost
+on top of the protocol's 2–3 day Phase 1 estimate, which assumed π_nom already
+existed; you know your own wall-clock for 2,000 iterations at 2,048 envs better
+than I can guess it.
 
 ```bash
 python experiments/e1/train_policy.py --policy pi_nom \
-    --task go1_amp --headless --max_iterations 6000
+    --task go1_amp --headless   # 2000 iterations, the train.py default
 # -> logs/go1_viploco_warp_v5/pi_nom/model_*.pt  (+ policy_config.json)
 ```
 
@@ -63,40 +64,23 @@ is untouched (`safety_value` is not in `rewards.scales`, so
 same run and lands in the same checkpoint, so there is no separate world-model
 step.
 
-**Why train past `train.py`'s hardcoded 2,000 — and how to know when to stop.**
-Not because of the reward curriculum: go1's only curriculum term is
-`feet_edge`, and `_reward_feet_edge` zeroes everything outside
-`[gap_start_idx, pit_end_idx]`, which is an empty slice under corridor +
-rough-flat proportions. `feet_edge` is identically zero here and its
-4,000→10,000 ramp never applies.
+**2,000 iterations, matching the original π_nom.** The comparison E1 makes is
+filter-vs-no-filter on the *same* policy, so what matters is that π_nom is
+trained the way the reported π_nom was. `train_policy.py` defaults to 2,000, as
+`train.py` does.
 
-The binding constraint is the **terrain curriculum**. Training starts every env
-at `max_init_terrain_level = 0` and promotes one level per episode only when the
-robot walks more than `terrain_length/2` = 4 m. For the corridor, the level *is*
-the difficulty axis that matters — `sinusoid_amplitude = 0.5 + 0.5·difficulty`
-(`terrain.py:362`), so the level sets how sharply the corridor snakes and
-therefore how hard it is to avoid the cylinders. Evaluation, meanwhile, disables
-the curriculum and assigns `terrain_levels = arange(num_envs) % 10`, i.e.
-**uniformly across all ten levels**. If training only ever promotes to level 3,
-the eval is mostly out of distribution and the unfiltered row is measuring
-"π_nom has not seen this corridor" rather than anything about the filter.
+(The `feet_edge` reward curriculum is irrelevant either way:
+`_reward_feet_edge` zeroes everything outside `[gap_start_idx, pit_end_idx]`,
+an empty slice under corridor + rough-flat proportions, so the term is
+identically zero here — and it is go1's only `reward_curriculum_term`.)
 
-So the stopping rule is a plateau, not an iteration count: watch
-`Episode/terrain_level` in TensorBoard (already logged via
-`extras["episode"]["terrain_level"]`) and train until the mean level plateaus
-near the top of the 10 levels. `TRAIN_ITERS=6000` is a reasonable first leg —
-check the curve, then extend if it is still climbing:
+If you ever want to extend a run rather than restart it, `--max_iterations` on
+a resume is *additional* iterations, not a target:
 
 ```bash
-# adds 4000 more iterations on top of whatever the checkpoint reached
 python experiments/e1/train_policy.py --policy pi_nom --task go1_amp \
-    --headless --resume --load_run pi_nom --max_iterations 4000
+    --headless --resume --load_run pi_nom --max_iterations 1000
 ```
-
-The second reason to care is E1-specific: the verdict rule measures the
-filter's fall rate *against unfiltered π_nom's*, so an under-trained π_nom that
-already falls often compresses exactly the signal E1 is looking for. That is
-what step 2 gates on.
 
 **2. Gate on π_nom's quality before spending anything else.** Do not skip this
 — every later number is relative to this row.
@@ -107,14 +91,20 @@ python experiments/e1/run_e1.py --task go1_amp --headless \
     --n_episodes 250 --eval_envs 250 --out_dir logs/e1/precheck
 ```
 
-Look for: fall rate well under ~15%, return clearly positive, `vel_err` small
-relative to the 0.6 m/s command, and a **non-trivial collision rate** (the
-corridor should actually be challenging it — near-0% means the obstacles aren't
-being hit and there is nothing for a collision filter to improve). If fall rate
-is high or return is near zero, train longer and re-gate rather than proceeding.
+This is a characterisation of π_nom, not a pass/fail on training length. Eval
+deliberately disables the terrain curriculum and spreads envs over all ten
+levels (`terrain_levels = arange(num_envs) % 10`), including levels the training
+curriculum never promoted anyone to — a policy too weak for the hard corridors
+should be *shown* failing on them. The filtered and unfiltered rows see exactly
+the same level distribution, so the E1 comparison stays internally valid however
+far training got.
 
-Worth splitting by difficulty here, since eval covers all ten levels uniformly
-while training promotes gradually:
+The one thing worth checking before spending GPU-hours is that there is a signal
+to measure at all: a **non-trivial collision rate** (near-0% means the cylinders
+are never being hit and a collision filter has nothing to improve) and a return
+that isn't pinned at zero.
+
+The per-level breakdown is worth having as a reported property:
 
 ```python
 import csv, collections
@@ -131,9 +121,11 @@ for lvl in sorted(by):
               / sum(int(r["n_steps"]) for r in g)))
 ```
 
-A clean policy degrades gently with level. A cliff at some level — fall rate
-jumping from ~5% to ~60% — means the terrain curriculum never got that far, and
-the fix is more training, not a different filter.
+Corridor difficulty is `sinusoid_amplitude = 0.5 + 0.5·difficulty`
+(`terrain.py:362`), so the level sets how sharply the corridor snakes. Where the
+curve breaks tells you which corridor geometries π_nom cannot handle unaided —
+useful context for reading how much of E1's fall rate the filter caused versus
+inherited.
 
 **3. Pin it.** This is the §1.1 invariant — one checkpoint, hash recorded, and
 the *same* one on the joint-limit branch later. The hash goes into every run
@@ -145,17 +137,15 @@ export PI_NOM_CKPT=-1          # or a specific iteration number
 export PI_RS_RUN=               # leave empty -- see below
 ```
 
-**On π_rs: skip it for E1.** The protocol wants Q̂ trained on mixed π_nom + π_rs
-substrates for action coverage, and lists a π_rs sweep point as optional. But
-π_rs costs another GPU-day, and the coverage problem it addresses is handled
-more directly by the injected action noise (below), which perturbs actions
-*off* any policy's manifold rather than sampling a second manifold. For E1 the
-trade isn't worth a day. Note the deviation in App. J. π_rs does become
-genuinely necessary for E2, where it is the Reward-only row — train it then:
+**On π_rs — your call, see the open questions below.** The protocol wants Q̂
+trained on mixed π_nom + π_rs substrates for action coverage, and lists a π_rs
+sweep point as optional. It costs a second training run of the same length. If
+you skip it, note the deviation in App. J. π_rs is separately required for E2,
+where it is the Reward-only row:
 
 ```bash
 python experiments/e1/train_policy.py --policy pi_rs --rs_weight 1.0 \
-    --task go1_amp --headless --max_iterations 10000
+    --task go1_amp --headless
 ```
 
 **π_ours is not needed for E1.** The verdict rule quotes the paper's own
@@ -271,10 +261,15 @@ Table R1a markdown and LaTeX ready to paste.
 
 ---
 
-## Decisions I made, and why
+## Settings in force, and why
 
-These are the places the protocol left room, or where the code forced a choice.
-Each is recorded in the run manifest.
+Where the protocol left room or the code forced a choice. The first four were
+your calls; the rest follow from the code. All are recorded in the run manifest.
+
+**Confirmed choices:** π_nom only (no π_rs — note the §2 deviation in App. J);
+action-noise injection kept at σ = 0.05 rad on half the collection envs; domain
+randomisation **off** at eval (must match on the joint-limit branch); safety-return
+**α = 0.95**.
 
 **π_nom's safety critic is untrained, so E1 trains its own trigger.**
 `AMPPPO.update` gates the entire safety branch behind `if self.safety_coef > 0`
@@ -307,12 +302,14 @@ exists precisely to rule out "sampling is a strawman". `--grad_normalize none`
 gives the literal form.
 
 **Injected action noise during Q̂ data collection** (`--action_noise 0.20` raw
-≈ 0.05 rad, on half the envs). Mixed substrates broaden coverage over *states*;
-the E1 filter evaluates Q̂ at actions drawn uniformly from an ε-box around
-a_pol, which no rollout policy ever takes. Without off-policy action coverage,
-Q̂'s dependence on `a` is unconstrained by data and the sweep measures
-extrapolation rather than projection. `--noise_frac 0` reproduces the literal
-protocol.
+≈ 0.05 rad, on half the envs) — an addition beyond the protocol, kept by your
+call. Mixed substrates broaden coverage over *states*; the E1 filter evaluates
+Q̂ at actions drawn uniformly from an ε-box around a_pol, which no rollout
+policy ever takes. Without off-policy action coverage, Q̂'s dependence on `a` is
+unconstrained by data and the sweep measures extrapolation rather than
+projection. `--noise_frac 0` reproduces the literal protocol. Since π_rs is not
+being trained, this is the *only* source of action-space breadth in Q̂'s
+training set — worth one sentence in App. J.
 
 **Episode identity across methods.** IsaacGym has no per-episode seed, so
 `eval_seeds.json` is consumed as *chunk* seeds: re-seed globally, full
@@ -322,8 +319,8 @@ filtered steps contaminates later episodes. Terrain is generated once at env
 creation under a fixed `TERRAIN_SEED = 1`, so the corridors themselves are
 identical across all rows.
 
-**DR off at eval** (§1.1 invariant #4 — decide once, record it). Ranges are
-collapsed rather than flags flipped: several `randomize_*` booleans gate blocks
+**DR off at eval** (§1.1 invariant #4 — decided once, recorded, and it must
+match on the joint-limit branch). Ranges are collapsed rather than flags flipped: several `randomize_*` booleans gate blocks
 of `privileged_obs_buf` and turning them off would change the observation width
 and silently break the checkpoint.
 
@@ -355,12 +352,12 @@ any denominator either.
    signatures in `play.py`, `wmp_runner.py` and `legged_robot.py` but has not
    been executed. Expect to shake out an import or a shape on the first
    `collect` run — send me the traceback and it'll be a quick fix.
-3. **`--alpha` for the safety-return target defaults to 0.7**, which is what
-   `rollout_storage.py:176` actually uses. Its own docstring says 0.95/0.05 and
-   Table 4 says 0.80 — that is `viploco_codebase_addendum.md` §2's open
-   reconciliation item. The value used is recorded in `qsafe.report.json`; if
-   the Day-0 reconciliation lands on 0.80, re-run stage 2 with `ALPHA=0.8`
-   (stage 1's buffers are unaffected, so it's ~20 minutes, not a re-collect).
+3. **The `alpha` reconciliation is still open in the code.**
+   `rollout_storage.py:176` runs 0.7, its own docstring says 0.95/0.05, and
+   Table 4 says 0.80 (`viploco_codebase_addendum.md` §2). E1 uses **0.95** for
+   Q̂'s targets, recorded in `qsafe.report.json` — but the training path still
+   runs 0.7, so the two are not yet consistent. Changing your mind later is
+   cheap: re-run stage 2 with `ALPHA=<x>`; stage 1's buffers are unaffected.
 4. **`cone_constraint.py:63-64` still hardcodes `d_safe = -0.4`,
    `d_danger = -0.6`**, discarding the passed arguments. That is the addendum's
    highest-priority §2 item. It does not affect E1 (which never calls the
