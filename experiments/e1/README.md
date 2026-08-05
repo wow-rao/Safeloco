@@ -180,15 +180,19 @@ The numbers will be meaningless at 16 episodes; what you're checking is that
 all five stages complete, the trust-region assertion never fires, and the
 unfiltered row reports 0% activation. Then `rm -rf logs/e1_smoke`.
 
-`--collect_steps` has to comfortably exceed one episode. A step is only usable
+`collect_qsafe_data.py` reports **"% of steps usable"** — that is the number
+that matters, not the episode count. `--collect_steps` has to comfortably
+exceed one episode. A step is only usable
 once its episode has **finished** — the safety-return recursion runs backwards
 from the terminal step, so a trailing episode that never ends has no target and
 is dropped. Episodes here run to 1001 steps (`max_episode_length = 1000`), and
 collection staggers the episode clocks at reset (as training's
 `init_at_random_ep_len` does) so episodes finish throughout the window instead
 of all at the end. `collect_qsafe_data.py` prints the episode-end count and
-warns if too few finished; `train_qsafe.py` refuses to train on an empty set
-rather than silently producing NaNs.
+warns when the usable share is low; `train_qsafe.py` refuses to train on an
+empty set rather than silently producing NaNs. At smoke-test scale a usable
+share around 15-20% is normal and fine — the point there is plumbing. For the
+real collection, `--collect_steps 2000` against 1001-step episodes gives ~75%.
 
 **5. Run the E1 pipeline** (≈ 4–6 h once π_nom exists):
 

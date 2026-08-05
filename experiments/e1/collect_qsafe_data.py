@@ -77,6 +77,17 @@ import torch  # noqa: E402
 from safeloco_eval import eval_common as EC  # noqa: E402
 
 
+def _valid_fraction(done):
+    """Share of [T, B] steps that have a later (or coincident) episode end.
+
+    Identical to the validity mask `train_qsafe.py` applies, so the number
+    printed here is exactly the number of rows that survive into training.
+    """
+    has_future_done = torch.flip(
+        torch.cummax(torch.flip(done.float(), [0]), dim=0).values, [0])
+    return (has_future_done > 0).float().mean()
+
+
 def main():
     args = get_args()
     args.rl_device = args.sim_device
@@ -204,18 +215,29 @@ def main():
         "grid_shape": list(rt.grid_shape) if store_grid else None,
         "git_commit": EC.git_commit(),
         "n_episode_ends": int(buf["done"].sum()),
+        # Fraction of steps whose episode finishes inside the window; the rest
+        # have no safety-return target and are dropped by train_qsafe.py. This
+        # is the number that decides whether a buffer is worth training on.
+        "valid_fraction": float(_valid_fraction(buf["done"])),
     }
     with open(ARGS.out + ".meta.json", "w") as f:
         json.dump(meta, f, indent=2)
     n_ends = meta["n_episode_ends"]
-    print("[collect] wrote {}.pt ({} episode ends, {} collision steps)".format(
-        ARGS.out, n_ends, meta["n_collision_steps"]))
-    if n_ends < B:
-        print("[collect] WARNING: only {} episodes finished across {} envs in "
-              "{} steps. Steps whose episode never ends are dropped by "
-              "train_qsafe.py, so this buffer will train on little or "
-              "nothing. Episodes run up to {} steps -- raise --collect_steps."
-              .format(n_ends, B, T, int(env.max_episode_length)))
+    print("[collect] wrote {}.pt: {} episode ends, {} collision steps, "
+          "{:.1%} of steps usable".format(
+              ARGS.out, n_ends, meta["n_collision_steps"],
+              meta["valid_fraction"]))
+    if n_ends < 2:
+        print("[collect] ERROR: {} episodes finished, so train_qsafe.py cannot "
+              "form a train/val split. Episodes run up to {} steps; raise "
+              "--collect_steps.".format(n_ends, int(env.max_episode_length)))
+    elif meta["valid_fraction"] < 0.4:
+        print("[collect] NOTE: only {:.1%} of steps are usable. A step counts "
+              "only once its episode has finished, so a window near the "
+              "episode length ({} steps) wastes most of it. Fine for a smoke "
+              "test; for the real collection raise --collect_steps to ~2x the "
+              "episode length or more.".format(
+                  meta["valid_fraction"], int(env.max_episode_length)))
 
 
 if __name__ == "__main__":
