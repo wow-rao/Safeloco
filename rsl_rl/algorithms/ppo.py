@@ -40,7 +40,8 @@ from rsl_rl.modules import ActorCriticWMP
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.storage.replay_buffer import ReplayBuffer
 from rsl_rl.algorithms.cone_constraint import (
-    extract_flat_grads, write_flat_grads, damped_null_space_project
+    extract_flat_grads, write_flat_grads, damped_null_space_project,
+    DEFAULT_D_SAFE, DEFAULT_D_DANGER
 )
 
 
@@ -66,8 +67,8 @@ class PPO:
                  min_std=None,
                  safety_coef=0.5,
                  safety_value_loss_coef=1.0,
-                 d_safe=0.3,
-                 d_danger=-0.3,
+                 d_safe=DEFAULT_D_SAFE,
+                 d_danger=DEFAULT_D_DANGER,
                  ):
 
         self.device = device

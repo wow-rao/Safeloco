@@ -597,6 +597,9 @@ class WMPRunner:
         if getattr(self.alg, 'adaptive_safety', False):
             self.writer.add_scalar('Safety/collision_rate_ema', self.alg.collision_rate_ema, locs['it'])
             self.writer.add_scalar('Safety/safety_coef', self.alg.safety_coef, locs['it'])
+        if hasattr(self.alg, 'd_safe'):
+            self.writer.add_scalar('Safety/d_safe', self.alg.d_safe, locs['it'])
+            self.writer.add_scalar('Safety/d_danger', self.alg.d_danger, locs['it'])
         self.writer.add_scalar('Loss/learning_rate', self.alg.learning_rate, locs['it'])
         if self.cfg['use_amp']:
             self.writer.add_scalar('Loss/AMP', locs['mean_amp_loss'], locs['it'])

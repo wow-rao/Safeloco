@@ -3,6 +3,15 @@ import torch
 import torch.nn.functional as F
 
 
+# Until this was fixed, `damped_null_space_project` overwrote whatever the
+# caller passed with these two values, so every policy trained in this repo
+# used them regardless of what its config said.  They stay the default so
+# existing results reproduce; set `d_safe` / `d_danger` in the algorithm config
+# to vary them.
+DEFAULT_D_SAFE = -0.4
+DEFAULT_D_DANGER = -0.6
+
+
 def cone_constrained_update(g_task, g_safe, alpha_deg=60.0):
     """Project g_task into the cone of half-angle alpha_deg around g_safe.
 
@@ -49,17 +58,23 @@ def dynamic_alpha(h_min, d_min=0.0, d_free=2.0, alpha_max_deg=70.0):
 
 
 def damped_null_space_project(g_task, g_safety, safety_value_batch,
-                              d_safe=0.3, d_danger=-0.3):
+                              d_safe=DEFAULT_D_SAFE, d_danger=DEFAULT_D_DANGER):
     """Project g_safety into the null space of g_task with damping.
 
     When safety_value > d_safe: full null projection (task dominates).
     When safety_value < d_danger: no projection (safety dominates).
     Between: linear interpolation.
+
+    Both thresholds are honoured exactly as passed.  `d_safe` must be strictly
+    greater than `d_danger` -- the ramp runs upward from d_danger to d_safe,
+    and inverting them silently reverses the safety response.
     """
     eps = 1e-8
-    
-    d_safe = -0.4
-    d_danger = -0.6
+
+    if d_safe <= d_danger:
+        raise ValueError(
+            "d_safe (%r) must be > d_danger (%r); the damping ramp runs "
+            "from d_danger up to d_safe." % (d_safe, d_danger))
 
     if safety_value_batch.dim() > 0:
         sv_min = safety_value_batch.min().item()
