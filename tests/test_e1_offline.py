@@ -240,11 +240,17 @@ def build_world(path, kind, qsafe_ok=True):
     """Three synthetic worlds with known ground-truth verdicts."""
     os.makedirs(path, exist_ok=True)
     rng = random.Random(7)
-    battery = {"spearman_rho_q": 0.72 if qsafe_ok else 0.31,
-               "auroc_q_collision20": 0.86 if qsafe_ok else 0.62,
-               "auroc_min_cbf_h_baseline": 0.70}
+    if qsafe_ok is None:                       # battery undecidable
+        battery = {"spearman_rho_q": float("nan"),
+                   "auroc_q_collision20": float("nan"),
+                   "auroc_min_cbf_h_baseline": float("nan")}
+    else:
+        battery = {"spearman_rho_q": 0.72 if qsafe_ok else 0.31,
+                   "auroc_q_collision20": 0.86 if qsafe_ok else 0.62,
+                   "auroc_min_cbf_h_baseline": 0.70}
     man_q = {"qsafe_battery": battery,
              "qsafe_verdict": {"critic_informative": qsafe_ok,
+                               "battery_decidable": qsafe_ok is not None,
                                "beats_distance_heuristic": True}}
     synth_run(path, "pi_nom_unfiltered", "none", None, 400, 0.139, 0.05, 34.0,
               rng=rng, manifest=man_q)
@@ -340,6 +346,13 @@ def test_verdict_pipeline():
                   "rho = 0.31" in blob["rebuttal_sentence"]
                   and "AUROC = 0.62" in blob["rebuttal_sentence"],
                   blob["rebuttal_sentence"])
+        # --- world 4: battery undecidable -> must NOT claim Q-hat failed --
+        d = os.path.join(tmp, "undecided")
+        build_world(d, "holds", qsafe_ok=None)
+        blob = run_analyzer(d, os.path.join(tmp, "R1a_und"))
+        if blob:
+            check("undecidable Q-hat battery does not hijack the sentence",
+                  blob["rebuttal_key"] == "e1_holds", blob["rebuttal_key"])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

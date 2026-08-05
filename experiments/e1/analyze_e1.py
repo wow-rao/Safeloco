@@ -308,7 +308,10 @@ def rebuttal_sentence(verdict, sweep_rows, unfiltered_row, qsafe_report):
     """The §7 decision tree.  The Q-hat guard outranks the sweep outcome."""
     if qsafe_report:
         b = qsafe_report.get("battery", {})
-        if not qsafe_report.get("verdict", {}).get("critic_informative", True):
+        # Only a measured failure switches the sentence. `None` means the
+        # battery was undecidable (e.g. no positives in the validation split),
+        # which is not evidence against the critic.
+        if qsafe_report.get("verdict", {}).get("critic_informative") is False:
             return ("qhat_failed_validation",
                     S7_QHAT_FAILED.format(
                         rho=b.get("spearman_rho_q", float("nan")),

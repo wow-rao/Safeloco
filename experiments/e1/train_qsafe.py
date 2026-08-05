@@ -32,6 +32,7 @@ Usage
 
 import argparse
 import gc
+import math
 import inspect
 import json
 import os
@@ -302,8 +303,16 @@ def main():
     calib = ST.calibration_curve(q_va.tolist(), tgt.tolist(), n_bins=10)
     mse = float((q_va - tgt).pow(2).mean())
 
-    passed = (rho >= RHO_THRESHOLD) and (auc_q >= AUROC_THRESHOLD)
-    beats_heuristic = auc_q > auc_h
+    # The battery is only decidable when the validation split actually
+    # contains both classes.  With no collision-within-H positives every AUROC
+    # is nan, and `nan >= threshold` is False -- which would silently report a
+    # *failed* critic when the truth is that nothing was measured.  Keep the
+    # three states distinct: True / False / None (undecidable).
+    n_pos = sum(1 for x in lab if x)
+    decidable = (0 < n_pos < len(lab)) and not math.isnan(rho)
+    passed = (((rho >= RHO_THRESHOLD) and (auc_q >= AUROC_THRESHOLD))
+              if decidable else None)
+    beats_heuristic = (auc_q > auc_h) if decidable else None
 
     report = {
         "alpha": args.alpha,
@@ -326,17 +335,27 @@ def main():
         },
         "thresholds": {"rho": RHO_THRESHOLD, "auroc": AUROC_THRESHOLD},
         "verdict": {
-            "critic_informative": bool(passed),
-            "beats_distance_heuristic": bool(beats_heuristic),
+            "battery_decidable": bool(decidable),
+            "n_collision_positives": int(n_pos),
+            "critic_informative": (None if passed is None else bool(passed)),
+            "beats_distance_heuristic": (None if beats_heuristic is None
+                                         else bool(beats_heuristic)),
             "e1_interpretation": (
-                "standard" if passed else
+                "UNDECIDABLE: the validation split contains {} of {} "
+                "collision-within-{} positives, so every AUROC is undefined. "
+                "This is not a failed critic -- nothing was measured. Collect "
+                "a buffer with enough completed episodes (and enough "
+                "collisions in them) before reading this battery."
+                .format(n_pos, len(lab), COLLISION_HORIZON) if not decidable
+                else "standard" if passed else
                 "Q-hat failed its validation thresholds. E1's verdict is NOT "
                 "'projection fails' but 'usable learned joint-space barriers "
                 "are hard to obtain' -- analysis_protocol.md §7, row 'Q-hat "
                 "failed validation'."),
             "filter_target_note": (
-                "Q-hat beats the distance heuristic; use Q-hat." if
-                beats_heuristic else
+                "not decidable on this split" if beats_heuristic is None else
+                "Q-hat beats the distance heuristic; use Q-hat."
+                if beats_heuristic else
                 "Q-hat does NOT beat predicting collision from min_cbf_h "
                 "alone (analysis_protocol.md §5). The critic adds nothing and "
                 "E1's filter should be reported using the heuristic instead -- "
@@ -368,13 +387,14 @@ def main():
     print("  AUROC baseline (min_cbf_h)      {:.3f}".format(auc_h))
     print("  val MSE                         {:.5f}".format(mse))
     print("  delta = 0.05 * IQR(Q)           {:.5f}".format(0.05 * iqr))
-    print("  critic informative?             {}".format(
-        "YES" if passed else "NO"))
-    print("  beats distance heuristic?       {}".format(
-        "YES" if beats_heuristic else "NO"))
-    if not passed:
+    print("  collision-within-{} positives    {} / {}".format(
+        COLLISION_HORIZON, n_pos, len(lab)))
+    tri = {True: "YES", False: "NO", None: "UNDECIDABLE"}
+    print("  critic informative?             {}".format(tri[passed]))
+    print("  beats distance heuristic?       {}".format(tri[beats_heuristic]))
+    if passed is not True:
         print("\n  " + report["verdict"]["e1_interpretation"])
-    if not beats_heuristic:
+    if beats_heuristic is False:
         print("\n  " + report["verdict"]["filter_target_note"])
     print("=" * 74)
     print("wrote {}.pt and {}.report.json".format(args.out, args.out))
