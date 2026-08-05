@@ -59,6 +59,12 @@ OURS_COLLISION_RATE = 0.044
 OURS_RETURN = 33.9
 OURS_MEAN_LAT_VEL = 0.085
 REWARD_SHAPING_COLLISION_RATE = 0.139
+# E2 (analysis_protocol.md §3.2).  "Reduces to shaping" means the collision
+# rate lands in the reward-shaping band rather than near ours -- the protocol
+# writes that band as "~12-14%", around the paper's 13.9% row.
+SHAPING_BAND_LO = 0.12
+SHAPING_BAND_HI = 0.14
+
 VERDICT_COLLISION_CEILING = 0.06   # "collision <= 6%"
 VERDICT_RETURN_FLOOR = 30.0        # "return >= 30"
 VERDICT_SMALL_EPS_FLOOR = 0.10     # "collision rate remains >= ~10%"
@@ -129,6 +135,25 @@ def collision_rate(recs):
 
 def eps_with_collision(recs):
     return sum(1 for r in recs if int(r["n_collision_steps"]) > 0), len(recs)
+
+
+def internalization_gap(recs_without, recs_with, rate_fn=None):
+    """metric(without filter) - metric(with filter), §1's E2/J2 row.
+
+    Sign convention is the protocol's: **positive means worse without the
+    filter**, i.e. the policy was leaning on it and never internalized the
+    constraint.  Defaults to collision rate; pass `rate_fn` for any other
+    (k, n) metric.
+    """
+    fn = rate_fn or collision_rate
+    kw, nw = fn(recs_without)
+    kv, nv = fn(recs_with)
+    return (kw / max(nw, 1)) - (kv / max(nv, 1))
+
+
+def in_shaping_band(rate):
+    """True if a collision rate sits inside the reward-shaping band."""
+    return SHAPING_BAND_LO <= rate <= SHAPING_BAND_HI
 
 
 def proximity_rate(recs):

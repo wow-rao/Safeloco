@@ -165,7 +165,111 @@ class WMPRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
 
+        # E2 training-time filtering (experiments/e2).  Inert unless an
+        # ActionFilter is assigned: the rollout executes the filtered action
+        # while the storage keeps the action the policy actually sampled, so
+        # the PPO update is credited with returns it did not generate.  That
+        # mismatch is the mechanism E2 tests, and `e2_diag` measures it.
+        self.train_filter = None
+        self.train_qsafe = None
+        self.train_store_executed = False
+        self.e2_diag_path = None
+        self._e2_reset_diag()
+
         _, _, _ = self.env.reset()
+
+    def _e2_reset_diag(self):
+        """Zero the per-iteration training-filter diagnostics."""
+        self.e2_diag = {"steps": 0, "filtered_steps": 0,
+                        "sum_dnorm_inf": 0.0, "sum_kl": 0.0}
+
+    E2_WM_KEYS = ("model_loss", "dyn_loss", "rep_loss", "image_loss", "reward_loss")
+
+    def _e2_log_row(self, it, wm_metrics, rewbuffer, lenbuffer):
+        """Append one training-diagnostics row, then reset the accumulators.
+
+        Written from `learn()` rather than `log()` because the world-model
+        losses are produced after `log()` runs and would otherwise lag by an
+        iteration.  No-op unless experiments/e2 set `e2_diag_path`.
+        """
+        if self.e2_diag_path is None:
+            return
+
+        import csv as _csv
+
+        d = self.e2_diag
+        steps = max(d["steps"], 1)
+        row = {
+            "iteration": it,
+            "mean_return": float(np.mean(rewbuffer)) if len(rewbuffer) else float("nan"),
+            "mean_ep_length": float(np.mean(lenbuffer)) if len(lenbuffer) else float("nan"),
+            "frac_filtered": d["filtered_steps"] / steps,
+            "mean_kl_exec_sampled": d["sum_kl"] / steps,
+            "mean_dnorm_inf": d["sum_dnorm_inf"] / steps,
+            "filter_steps_seen": d["steps"],
+        }
+        for k in self.E2_WM_KEYS:
+            v = (wm_metrics or {}).get(k)
+            row["wm_" + k] = float(np.mean(v)) if v is not None else ""
+
+        new = not os.path.exists(self.e2_diag_path)
+        with open(self.e2_diag_path, "a", newline="") as fh:
+            w = _csv.DictWriter(fh, fieldnames=list(row.keys()))
+            if new:
+                w.writeheader()
+            w.writerow(row)
+
+        self._e2_reset_diag()
+
+    def _apply_train_filter(self, actions, critic_obs, wm_feature, occ_grid):
+        """Filter sampled actions before execution; accumulate diagnostics.
+
+        Returns the actions to execute.  `actions` (the sampled ones) stay in
+        the rollout storage untouched -- see the note in __init__.  Mirrors
+        the deployment path in eval_common.EvalCollector so the training-time
+        and test-time filters are the same object under the same trigger.
+        """
+        if self.train_filter is None:
+            return actions
+
+        with torch.no_grad():
+            if self.train_qsafe is not None:
+                s_feat = self.train_qsafe.state_features(
+                    critic_obs.detach(),
+                    wm_feature.detach().to(critic_obs.device),
+                    occ_grid)
+                trigger = self.train_qsafe.v_from_features(s_feat)
+            else:
+                s_feat, trigger = None, None
+
+            a_exec, _info = self.train_filter.apply(actions, s_feat, trigger)
+
+            delta = a_exec - actions
+            dnorm_inf = delta.abs().amax(dim=-1)
+            n = actions.shape[0]
+            # KL between the policy's Gaussian recentred at the executed action
+            # and at the sampled one: 0.5 * sum(((a_exec - a_samp) / sigma)^2).
+            # Shared sigma makes the covariance terms cancel.
+            sigma = self.alg.actor_critic.std.detach().to(delta.device).clamp_min(1e-6)
+            kl = 0.5 * ((delta / sigma) ** 2).sum(dim=-1)
+
+            self.e2_diag["steps"] += n
+            self.e2_diag["filtered_steps"] += int((dnorm_inf > 1e-6).sum().item())
+            self.e2_diag["sum_dnorm_inf"] += float(dnorm_inf.sum().item())
+            self.e2_diag["sum_kl"] += float(kl.sum().item())
+
+            if self.train_store_executed:
+                # Contrast run: treat the filtered action as the behaviour
+                # action, so the update clones safe behaviour instead of being
+                # credited with returns it did not produce.  The log-prob has
+                # to be recomputed under the same distribution that produced
+                # the sample, or the PPO ratio starts from the wrong place.
+                tr = self.alg.transition
+                tr.actions = a_exec.detach()
+                tr.actions_log_prob = self.alg.actor_critic.get_actions_log_prob(
+                    a_exec).detach()
+
+        return a_exec
 
 
     def _build_world_model(self):
@@ -317,8 +421,11 @@ class WMPRunner:
                             obs, critic_obs, history, wm_feature,
                             safety_value=safety_value, grid=occ_grid)
 
+                    exec_actions = self._apply_train_filter(
+                        actions, critic_obs, wm_feature, occ_grid)
+
                     obs, privileged_obs, rewards, dones, infos, reset_env_ids, terminal_amp_states = self.env.step(
-                        actions)
+                        exec_actions)
 
                     if self.grid_enabled:
                         new_grid = infos.get("occupancy_grid", None)
@@ -453,6 +560,11 @@ class WMPRunner:
                 for name, values in wm_metrics.items():
                     self.writer.add_scalar('World_model/' + name, float(np.mean(values)), it)
             print('training world model time:', time.time() - start_time)
+
+            # E2: one row per iteration carrying both channel diagnostics --
+            # world-model losses (behaviour-cloning target corruption) and the
+            # filter's KL against the sampled action (PPO channel).
+            self._e2_log_row(it, wm_metrics, rewbuffer, lenbuffer)
 
             # copy the config file
             if(it == 0) and self.log_dir is not None:
