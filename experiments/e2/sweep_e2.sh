@@ -29,7 +29,7 @@ EPS_GRID="${EPS_GRID:-0.05 0.1 0.2 0.5}" # calibration only
 TAU="${TAU:--0.25}"
 FILTER="${FILTER:-A}"
 RS_WEIGHT="${RS_WEIGHT:-1.0}"
-TRAIN_ITERS="${TRAIN_ITERS:-1500}"
+TRAIN_ITERS="${TRAIN_ITERS:-2000}"
 CAL_ITERS="${CAL_ITERS:-150}"
 N_EPISODES="${N_EPISODES:-1000}"
 EVAL_ENVS="${EVAL_ENVS:-250}"
@@ -57,7 +57,7 @@ if [ "$stage" = "calibrate" ] || [ "$stage" = "all" ]; then
       --qsafe_report "${QSAFE_REPORT}" --calibrate "${CAL_ITERS}"
   done
   echo
-  echo "Read logs/${EXPERIMENT}/e2_filter_only_s1/calibration.json for each eps."
+  echo "Read logs/${EXPERIMENT}/e2_filter_only_s1_cal_eps<E>/calibration.json per eps."
   echo "Pick the largest eps that binds (frac_filtered well above 0) without a"
   echo "downward return trend, then re-run with EPS=<choice> ./sweep_e2.sh train"
 fi

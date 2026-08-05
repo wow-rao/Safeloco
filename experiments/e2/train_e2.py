@@ -81,7 +81,9 @@ def build_parser():
     p.add_argument("--qsafe_ckpt", type=str, default="logs/e1/qsafe.pt")
     p.add_argument("--qsafe_report", type=str, default="logs/e1/qsafe.report.json")
     p.add_argument("--filter_seed", type=int, default=1234)
-    p.add_argument("--max_iterations", type=int, default=1500)
+    p.add_argument("--max_iterations", type=int, default=2000,
+                   help="matches pi_nom/pi_rs (train_policy.py), so returns "
+                        "are comparable against the reference rows.")
     p.add_argument("--calibrate", type=int, default=0,
                    help="run only this many iterations and write a binding "
                         "report instead of a full training run.")
@@ -193,7 +195,14 @@ def attach_train_filter(runner, env_cfg, device):
 
 
 def run_name():
-    return "e2_{}_s{}".format(ARGS.variant, ARGS.seed)
+    base = "e2_{}_s{}".format(ARGS.variant, ARGS.seed)
+    if ARGS.calibrate:
+        # Calibration sweeps epsilon, so the run name has to carry it or every
+        # point writes into the same directory and appends to the same
+        # train_diag.csv -- which silently turns the per-epsilon report into a
+        # summary of the concatenation.
+        return "{}_cal_eps{:g}".format(base, ARGS.epsilon)
+    return base
 
 
 def main():
@@ -223,7 +232,12 @@ def main():
     if uses_filter(ARGS.variant):
         filter_record = attach_train_filter(runner, env_cfg, runner.device)
 
+    # Start each run's diagnostics clean.  Appending across runs is how the
+    # first calibration sweep produced a report covering all four epsilon
+    # values at once; re-running any single config would do the same.
     runner.e2_diag_path = os.path.join(log_dir, "train_diag.csv")
+    if os.path.exists(runner.e2_diag_path):
+        os.replace(runner.e2_diag_path, runner.e2_diag_path + ".prev")
 
     record = dict(delta,
                   run_name=train_cfg.runner.run_name,
@@ -280,6 +294,17 @@ def report_calibration(diag_path, log_dir):
         print("diagnostics file is empty")
         return
 
+    # Defensive: if a file ever holds more than one run (the iteration counter
+    # restarts), summarise only the last one rather than averaging across
+    # runs that had different settings.
+    starts = [i for i, r in enumerate(rows)
+              if i == 0 or _int(r.get("iteration")) <= _int(rows[i - 1].get("iteration"))]
+    if len(starts) > 1:
+        print("WARNING: {} runs found in {}; reporting only the last {} rows. "
+              "Earlier segments had different settings and were not averaged in."
+              .format(len(starts), diag_path, len(rows) - starts[-1]))
+        rows = rows[starts[-1]:]
+
     def col(name):
         out = []
         for r in rows:
@@ -324,6 +349,13 @@ def report_calibration(diag_path, log_dir):
 
 def _fmt(x):
     return "n/a" if x is None else "{:.2f}".format(x)
+
+
+def _int(x, default=-1):
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return default
 
 
 if __name__ == "__main__":
