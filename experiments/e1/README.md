@@ -51,7 +51,7 @@ single biggest cost in Phase 1 — roughly a GPU-day on top of the protocol's
 
 ```bash
 python experiments/e1/train_policy.py --policy pi_nom \
-    --task go1_amp --headless --max_iterations 10000
+    --task go1_amp --headless --max_iterations 6000
 # -> logs/go1_viploco_warp_v5/pi_nom/model_*.pt  (+ policy_config.json)
 ```
 
@@ -63,13 +63,40 @@ is untouched (`safety_value` is not in `rewards.scales`, so
 same run and lands in the same checkpoint, so there is no separate world-model
 step.
 
-**Why 10,000 iterations and not `train.py`'s hardcoded 2,000.** The go1 config
-ramps the `feet_edge` penalty from 0.1 to 1.0 across iterations 4,000→10,000
-(`go1_amp_config.py:239`). A 2,000-iteration policy sits at the *start* of that
-curriculum and is not the policy the config was designed to produce. It also
-matters for E1 specifically: the verdict rule measures the filter's fall rate
-*against unfiltered π_nom's*, so an under-trained π_nom that already falls
-often compresses exactly the signal E1 is looking for.
+**Why train past `train.py`'s hardcoded 2,000 — and how to know when to stop.**
+Not because of the reward curriculum: go1's only curriculum term is
+`feet_edge`, and `_reward_feet_edge` zeroes everything outside
+`[gap_start_idx, pit_end_idx]`, which is an empty slice under corridor +
+rough-flat proportions. `feet_edge` is identically zero here and its
+4,000→10,000 ramp never applies.
+
+The binding constraint is the **terrain curriculum**. Training starts every env
+at `max_init_terrain_level = 0` and promotes one level per episode only when the
+robot walks more than `terrain_length/2` = 4 m. For the corridor, the level *is*
+the difficulty axis that matters — `sinusoid_amplitude = 0.5 + 0.5·difficulty`
+(`terrain.py:362`), so the level sets how sharply the corridor snakes and
+therefore how hard it is to avoid the cylinders. Evaluation, meanwhile, disables
+the curriculum and assigns `terrain_levels = arange(num_envs) % 10`, i.e.
+**uniformly across all ten levels**. If training only ever promotes to level 3,
+the eval is mostly out of distribution and the unfiltered row is measuring
+"π_nom has not seen this corridor" rather than anything about the filter.
+
+So the stopping rule is a plateau, not an iteration count: watch
+`Episode/terrain_level` in TensorBoard (already logged via
+`extras["episode"]["terrain_level"]`) and train until the mean level plateaus
+near the top of the 10 levels. `TRAIN_ITERS=6000` is a reasonable first leg —
+check the curve, then extend if it is still climbing:
+
+```bash
+# adds 4000 more iterations on top of whatever the checkpoint reached
+python experiments/e1/train_policy.py --policy pi_nom --task go1_amp \
+    --headless --resume --load_run pi_nom --max_iterations 4000
+```
+
+The second reason to care is E1-specific: the verdict rule measures the
+filter's fall rate *against unfiltered π_nom's*, so an under-trained π_nom that
+already falls often compresses exactly the signal E1 is looking for. That is
+what step 2 gates on.
 
 **2. Gate on π_nom's quality before spending anything else.** Do not skip this
 — every later number is relative to this row.
@@ -85,6 +112,28 @@ relative to the 0.6 m/s command, and a **non-trivial collision rate** (the
 corridor should actually be challenging it — near-0% means the obstacles aren't
 being hit and there is nothing for a collision filter to improve). If fall rate
 is high or return is near zero, train longer and re-gate rather than proceeding.
+
+Worth splitting by difficulty here, since eval covers all ten levels uniformly
+while training promotes gradually:
+
+```python
+import csv, collections
+rows = list(csv.DictReader(open("logs/e1/precheck/pi_nom_unfiltered.csv")))
+by = collections.defaultdict(list)
+for r in rows:
+    by[int(r["terrain_level"])].append(r)
+for lvl in sorted(by):
+    g = by[lvl]
+    print(lvl, len(g),
+          "fall {:.0%}".format(sum(int(r["fell"]) for r in g) / len(g)),
+          "coll {:.1%}".format(
+              sum(int(r["n_collision_steps"]) for r in g)
+              / sum(int(r["n_steps"]) for r in g)))
+```
+
+A clean policy degrades gently with level. A cliff at some level — fall rate
+jumping from ~5% to ~60% — means the terrain curriculum never got that far, and
+the fix is more training, not a different filter.
 
 **3. Pin it.** This is the §1.1 invariant — one checkpoint, hash recorded, and
 the *same* one on the joint-limit branch later. The hash goes into every run

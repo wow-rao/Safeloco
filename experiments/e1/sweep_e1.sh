@@ -2,8 +2,9 @@
 # E1 -- deployment-time joint-space projection, collision.  Full pipeline.
 #
 # Stages (run them individually, or `all` for everything after pretrain):
-#   pretrain  train pi_nom from scratch -- ~a GPU-day, NOT part of `all`
-#   precheck  evaluate unfiltered pi_nom  <-- GATE on policy quality, read it
+#   pretrain         train pi_nom from scratch -- ~a GPU-day, NOT part of `all`
+#   pretrain_resume  continue that run for TRAIN_ITERS more iterations
+#   precheck         evaluate unfiltered pi_nom  <-- GATE on policy quality
 #   collect   roll out pi_nom (and optionally pi_rs) -> Q_safe training buffers
 #   train     fit Q_safe offline + validation battery   <-- GATE, read it
 #   sweep     the epsilon sweep + variants + ablations
@@ -19,7 +20,8 @@ cd "$(dirname "$0")/../.."
 PI_NOM_RUN="${PI_NOM_RUN:-pi_nom}"        # run dir under logs/<experiment_name>/
 PI_NOM_CKPT="${PI_NOM_CKPT:--1}"          # -1 = last checkpoint in that run
 PI_RS_RUN="${PI_RS_RUN:-}"                # optional reward-shaping run
-TRAIN_ITERS="${TRAIN_ITERS:-10000}"       # pretrain only; past the feet_edge curriculum
+TRAIN_ITERS="${TRAIN_ITERS:-6000}"        # pretrain only; extend until the
+                                          # terrain-level curve plateaus
 TASK="${TASK:-go1_amp}"
 DEVICE="${DEVICE:-cuda:0}"
 OUT="${OUT:-logs/e1}"
@@ -42,6 +44,19 @@ stage_pretrain() {
     --task "${TASK}" --headless --sim_device "${DEVICE}" \
     --rl_device "${DEVICE}" --run_name "${PI_NOM_RUN}" \
     --max_iterations "${TRAIN_ITERS}"
+  echo
+  echo ">>> Watch Episode/terrain_level in TensorBoard. Eval assigns all ten"
+  echo ">>> levels uniformly, so stop when the mean level plateaus near the"
+  echo ">>> top -- not at a fixed iteration count. To extend:"
+  echo ">>>   $0 pretrain_resume   (adds TRAIN_ITERS more iterations)"
+}
+
+stage_pretrain_resume() {
+  echo "=== [E1] resuming pi_nom for ${TRAIN_ITERS} more iterations ==="
+  python experiments/e1/train_policy.py --policy pi_nom \
+    --task "${TASK}" --headless --sim_device "${DEVICE}" \
+    --rl_device "${DEVICE}" --run_name "${PI_NOM_RUN}" \
+    --resume --load_run "${PI_NOM_RUN}" --max_iterations "${TRAIN_ITERS}"
 }
 
 stage_precheck() {
@@ -147,14 +162,15 @@ stage_analyze() {
 }
 
 case "${1:-all}" in
-  pretrain) stage_pretrain ;;
-  precheck) stage_precheck ;;
+  pretrain)        stage_pretrain ;;
+  pretrain_resume) stage_pretrain_resume ;;
+  precheck)        stage_precheck ;;
   collect)  stage_collect ;;
   train)    stage_train ;;
   sweep)    stage_sweep ;;
   analyze)  stage_analyze ;;
   # `all` deliberately excludes pretrain: it is a GPU-day and has its own gate.
   all)      stage_collect; stage_train; stage_sweep; stage_analyze ;;
-  *) echo "usage: $0 {pretrain|precheck|collect|train|sweep|analyze|all}"
+  *) echo "usage: $0 {pretrain|pretrain_resume|precheck|collect|train|sweep|analyze|all}"
      exit 1 ;;
 esac
