@@ -359,7 +359,8 @@ class LeggedRobot(BaseTask):
     def check_termination(self):
         """ Check if environments need to be reset
         """
-        self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
+        self.term_contact = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
+        self.reset_buf = self.term_contact.clone()
         vel_error = self.base_lin_vel[:, 0] - self.commands[:, 0]
         self.vel_violate = ((vel_error > 1.5) & (self.commands[:, 0] < 0.)) | ((vel_error < -1.5) & (self.commands[:, 0] > 0.))
         self.vel_violate *= (self.terrain_levels > 3)
@@ -370,6 +371,13 @@ class LeggedRobot(BaseTask):
 
         self.fall = (self.root_states[:, 9] < -3.) | (self.projected_gravity[:, 2] > 0.)
         self.reset_buf |= self.fall
+
+        # Terminal-state snapshot for the shared eval module (safeloco_eval).
+        # reset_idx() runs immediately after this and overwrites root_states,
+        # so the fall definition has to read the pose here or not at all.
+        self.term_proj_grav_z = self.projected_gravity[:, 2].clone()
+        self.term_base_z_rel = self.root_states[:, 2] - self.env_origins[:, 2]
+        self.term_base_vel_z = self.root_states[:, 9].clone()
 
     def reset_idx(self, env_ids):
         """ Reset some environments.

@@ -1,0 +1,260 @@
+# E1 — Deployment-time joint-space projection, collision
+
+Implements `experiment_protocol_phased.md` §3 (E1), the §2 Q̂_safe construction
+it depends on, and the §1.1 shared-invariant machinery, against the actual
+Safeloco code (`viploco_codebase_addendum.md` §3.1–3.2).
+
+Nothing here trains a policy. π_nom is frozen; the filter sits between
+`act_inference(...)` and `env.step(...)`.
+
+---
+
+## What was added
+
+| Path | Role |
+|---|---|
+| `safeloco_eval/` | **Cross-phase invariant module** — copy verbatim to the joint-limit branch (§1.1) |
+| `safeloco_eval/metrics.py` | every threshold and derived metric, defined once (§1) |
+| `safeloco_eval/stats.py` | Wilson CIs, Spearman, AUROC, bootstrap — pure stdlib (§2) |
+| `safeloco_eval/eval_common.py` | the eval loop refactored out of `play.py`, termination definition, per-episode records |
+| `safeloco_eval/filters.py` | E1-A sampling projection, E1-B gradient projection (J1's clamp lands here in Phase 2) |
+| `safeloco_eval/qsafe.py` | Q̂_safe / V̂_safe, safety-return targets, collision labels |
+| `safeloco_eval/seeds.py` + `eval_seeds.json` | the shared 1,000-episode seed list |
+| `experiments/e1/collect_qsafe_data.py` | roll out π_nom / π_rs → Q̂ training buffers |
+| `experiments/e1/train_qsafe.py` | offline Q̂ fit + the §2 validation battery |
+| `experiments/e1/run_e1.py` | one sweep point → per-episode CSV + manifest |
+| `experiments/e1/analyze_e1.py` | Table R1a, §5 sanity checks, §3.1 verdict, §7 sentence, headline figure |
+| `experiments/e1/sweep_e1.sh` | the whole pipeline |
+| `tests/test_e1_offline.py` | offline tests — no GPU, no IsaacGym, no torch needed |
+
+One 4-line change to `legged_gym/envs/base/legged_robot.py::check_termination`:
+it now snapshots `term_contact`, `term_proj_grav_z`, `term_base_z_rel`,
+`term_base_vel_z`. `reset_idx()` runs immediately after and overwrites
+`root_states`, so the fall definition has to read the terminal pose there or
+not at all. Behaviour is otherwise unchanged.
+
+---
+
+## Run it
+
+**0. Sanity, before touching the GPU** (takes ~5 s, needs nothing installed):
+
+```bash
+python tests/test_e1_offline.py
+```
+
+**1. Set the pinned π_nom run.** This is the §1.1 invariant — one checkpoint,
+hash recorded, and the *same* one on the joint-limit branch later.
+
+```bash
+export PI_NOM_RUN=<run dir name under logs/go1_viploco_warp_v5/>
+export PI_NOM_CKPT=-1          # or a specific iteration number
+export PI_RS_RUN=<reward-shaping run>   # optional but recommended (see below)
+```
+
+**1b. Smoke-test the plumbing first** — 5 minutes, and it catches every path,
+shape and import problem before you commit 4 hours. Run from the repo root
+(the world-model config loader resolves `dreamer/configs.yaml` relative to
+`sys.argv[0]`'s grandparent, so the scripts must stay three levels deep and be
+invoked from the root):
+
+```bash
+python experiments/e1/collect_qsafe_data.py --task go1_amp --headless \
+    --load_run "$PI_NOM_RUN" --collect_envs 16 --collect_steps 60 \
+    --out logs/e1_smoke/buf
+python experiments/e1/train_qsafe.py --buffers logs/e1_smoke/buf \
+    --out logs/e1_smoke/qsafe --epochs 2 --ensemble 1
+python experiments/e1/run_e1.py --task go1_amp --headless \
+    --load_run "$PI_NOM_RUN" --qsafe_ckpt logs/e1_smoke/qsafe.pt \
+    --filter A --epsilon 0.1 --n_episodes 16 --eval_envs 16 \
+    --out_dir logs/e1_smoke/sweep
+python experiments/e1/run_e1.py --task go1_amp --headless \
+    --load_run "$PI_NOM_RUN" --qsafe_ckpt logs/e1_smoke/qsafe.pt \
+    --filter none --n_episodes 16 --eval_envs 16 --out_dir logs/e1_smoke/sweep
+python experiments/e1/analyze_e1.py --dir logs/e1_smoke/sweep \
+    --out logs/e1_smoke/R1a
+```
+
+The numbers will be meaningless at 16 episodes; what you're checking is that
+all five stages complete, the trust-region assertion never fires, and the
+unfiltered row reports 0% activation. Then `rm -rf logs/e1_smoke`.
+
+**2. Run the pipeline** (one RTX-5000-Ada-class GPU; ≈ 4–6 h total):
+
+```bash
+./experiments/e1/sweep_e1.sh all
+```
+
+or stage by stage, which is what I'd actually do:
+
+```bash
+./experiments/e1/sweep_e1.sh collect    # ~20-40 min, writes ~2 GB per policy
+./experiments/e1/sweep_e1.sh train      # ~10-30 min  <-- READ THE GATE OUTPUT
+./experiments/e1/sweep_e1.sh sweep      # ~2-4 h, 10-11 configurations
+./experiments/e1/sweep_e1.sh analyze    # seconds
+```
+
+Useful overrides: `N_EPISODES` (default 1000), `EVAL_ENVS` (default 250 —
+`N_EPISODES` should be a multiple of it), `COLLECT_STEPS`, `EPOCHS`, `DR`
+(`off`/`on`), `ALPHA`, `DEVICE`, `OUT`.
+
+### The gate after stage 2
+
+`train_qsafe.py` prints the §2 validation battery and whether the critic is
+informative (ρ ≥ 0.6, AUROC ≥ 0.8). **This changes which §7 sentence E1
+produces, not whether E1 runs.** If the battery fails, E1's finding is not
+"projection fails" but "usable learned joint-space barriers are hard to
+obtain" — still supportive, different sentence. `analyze_e1.py` picks the right
+one automatically from the manifest, so run the sweep either way.
+
+The battery also checks whether Q̂ beats a trivial distance heuristic
+(`min_cbf_h` alone) at the same AUROC task (analysis protocol §5). If it does
+not, the honest move is to re-run the sweep with the heuristic as the filter
+target — simpler and more defensible. Tell me if that fires and I'll wire it.
+
+### Sweep points that get run
+
+| # | Configuration | Why |
+|---|---|---|
+| 0 | unfiltered π_nom | the reference every verdict rule is relative to |
+| 1–5 | variant A, ε ∈ {0.02, 0.05, 0.1, 0.2, 0.5} rad, τ = −0.25 | the primary sweep |
+| 6–7 | variant B (gradient), ε ∈ {0.1, 0.5} | preempts "sampling is a strawman" |
+| 8 | variant A always-on, ε = 0.1 | separates trigger timing from correction effects |
+| 9 | variant A, ε = 0.1, τ = 0 | the secondary trigger |
+| 10 | variant A, ε = 0.1, 3-head min-aggregated Q̂ | the ensemble control |
+| 11 | π_rs, variant A, ε = 0.1 | optional, only if `PI_RS_RUN` is set |
+
+Each writes `logs/e1/sweep/<run_id>.csv` (per-episode records) and
+`<run_id>.manifest.json` (checkpoint hash, seed-file hash, eval-module hash,
+DR setting, δ, τ, thresholds).
+
+---
+
+## Sending me the results
+
+Everything I need is small — the CSVs are ~1000 rows each, and the whole set
+zips to a few MB. **Nothing binary, no checkpoints.**
+
+```bash
+cd /path/to/Safeloco
+zip -r e1_results.zip logs/e1/sweep/*.csv logs/e1/sweep/*.manifest.json \
+                      logs/e1/qsafe.report.json
+```
+
+Send me `e1_results.zip`. If you'd rather not zip, paste the output of:
+
+```bash
+python experiments/e1/analyze_e1.py --dir logs/e1/sweep --out logs/e1/R1a \
+    --qsafe_report logs/e1/qsafe.report.json
+cat logs/e1/R1a.md
+```
+
+— but the raw CSVs are better, because they let me recompute anything (e.g.
+re-derive the fall definition, split by terrain level, or check whether a
+difference in per-episode means clears its standard error) without another GPU
+run. Also send the console output of the `train` stage if anything looked off.
+
+I will then apply the §3.1 verdict rule, report every registered prediction as
+held / falsified / not-run, and give you the §7 rebuttal sentence plus the
+Table R1a markdown and LaTeX ready to paste.
+
+---
+
+## Decisions I made, and why
+
+These are the places the protocol left room, or where the code forced a choice.
+Each is recorded in the run manifest.
+
+**π_nom's safety critic is untrained, so E1 trains its own trigger.**
+`AMPPPO.update` gates the entire safety branch behind `if self.safety_coef > 0`
+(`amp_ppo.py:350`), and π_nom is trained with `safety_coef = 0`. The
+checkpoint's `safety_critic` head has therefore never received a gradient —
+triggering on it would be triggering on noise. `train_qsafe.py` fits a
+state-only V̂ head alongside Q̂ on the same targets, and that is the default
+trigger (`--trigger_source vhat`). `qpol` and `sv_oracle` exist as controls.
+
+**ε is in radians of joint command.** The protocol's sweep is in rad; this
+actor has no tanh (`actor_critic_wmp.py:163`), so the raw action box is
+`clip_actions = 6.0` and joint targets are `action_scale = 0.25` × action.
+Filters take ε in rad and convert internally. `‖Δa‖` is reported in rad, and
+`‖Δa‖∞ ≤ ε` is asserted on every filtered step.
+
+**Trust region is ∞-norm; min-distortion ranking is L2.** The constraint is the
+ε-box (that is what ε bounds); the objective that picks among qualifying
+samples is `‖a − a_pol‖₂`, which is what "minimum-distortion projection"
+means. Both norms are logged.
+
+**a_pol is not among the K candidates.** With δ > 0 it could never clear its own
+margin, and including it in the max-Q̂ fallback would turn the fallback into a
+no-op. Executing a correction that fails to clear the margin *is* the behaviour
+under test — it is what produces the large-ε regime.
+
+**Variant B normalises the gradient by default.** `--grad_normalize inf`
+rescales ∇_a Q̂ to unit ∞-norm so each of the m steps moves exactly η = ε/m.
+A raw gradient whose magnitude happens to be small would make B a no-op, and B
+exists precisely to rule out "sampling is a strawman". `--grad_normalize none`
+gives the literal form.
+
+**Injected action noise during Q̂ data collection** (`--action_noise 0.20` raw
+≈ 0.05 rad, on half the envs). Mixed substrates broaden coverage over *states*;
+the E1 filter evaluates Q̂ at actions drawn uniformly from an ε-box around
+a_pol, which no rollout policy ever takes. Without off-policy action coverage,
+Q̂'s dependence on `a` is unconstrained by data and the sweep measures
+extrapolation rather than projection. `--noise_frac 0` reproduces the literal
+protocol.
+
+**Episode identity across methods.** IsaacGym has no per-episode seed, so
+`eval_seeds.json` is consumed as *chunk* seeds: re-seed globally, full
+`env.reset()`, then record **only the first episode each env completes**. Every
+method sees the same 1,000 initial conditions, and no drift from earlier
+filtered steps contaminates later episodes. Terrain is generated once at env
+creation under a fixed `TERRAIN_SEED = 1`, so the corridors themselves are
+identical across all rows.
+
+**DR off at eval** (§1.1 invariant #4 — decide once, record it). Ranges are
+collapsed rather than flags flipped: several `randomize_*` booleans gate blocks
+of `privileged_obs_buf` and turning them off would change the observation width
+and silently break the checkpoint.
+
+**Fall definition** (one definition, both branches): terminal base tilt past
+60° (`projected_gravity_z > −0.5`) **or** base height below 0.15 m above its
+terrain cell, **or** the simulator's own hard flag. The repo's own `self.fall`
+alone (z-velocity < −3 m/s or fully inverted) is too strict to catch a stumble
+that ends in a belly-flop. All four raw terminal quantities are in the CSV, so
+the definition is recomputable post hoc without re-running.
+
+**Timing convention.** Per-step *state* quantities (joint margins, base
+velocities, yaw rate, contact phase, jerk) come from the state the policy acted
+on; per-transition quantities (reward, `min_cbf_h`) come from immediately after
+the step, where the env computes them before `reset_idx`. No post-reset value
+enters any metric. Episodes end at their fall, so no post-fall timesteps enter
+any denominator either.
+
+---
+
+## Things I could not do here, flagged rather than hidden
+
+1. **Validation battery item (iv), the branched-rollout spot check**, is not
+   implemented. It needs the simulator state-reset harness that E6 builds. The
+   Q̂ report lists it under `not_run` rather than leaving it silently absent.
+2. **I could not execute any of this.** This container has no GPU, no
+   IsaacGym, and no torch. The statistics, metric definitions, verdict rule and
+   full analysis pipeline are covered by `tests/test_e1_offline.py`, which does
+   run and passes; the simulator-facing code is written against the actual call
+   signatures in `play.py`, `wmp_runner.py` and `legged_robot.py` but has not
+   been executed. Expect to shake out an import or a shape on the first
+   `collect` run — send me the traceback and it'll be a quick fix.
+3. **`--alpha` for the safety-return target defaults to 0.7**, which is what
+   `rollout_storage.py:176` actually uses. Its own docstring says 0.95/0.05 and
+   Table 4 says 0.80 — that is `viploco_codebase_addendum.md` §2's open
+   reconciliation item. The value used is recorded in `qsafe.report.json`; if
+   the Day-0 reconciliation lands on 0.80, re-run stage 2 with `ALPHA=0.8`
+   (stage 1's buffers are unaffected, so it's ~20 minutes, not a re-collect).
+4. **`cone_constraint.py:63-64` still hardcodes `d_safe = -0.4`,
+   `d_danger = -0.6`**, discarding the passed arguments. That is the addendum's
+   highest-priority §2 item. It does not affect E1 (which never calls the
+   projection), but it does affect whether Table 5's ablation rows differ by
+   anything but seed noise. Out of scope here; flagging it because you'll want
+   it fixed before E2.
+5. **Only E1.** No E2/E3/E4/E5′/E6, no Phase 2. The `safeloco_eval` package is
+   laid out so J1's clamp is a new `ActionFilter` and nothing else changes.
