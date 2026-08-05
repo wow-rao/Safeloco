@@ -324,6 +324,20 @@ match on the joint-limit branch). Ranges are collapsed rather than flags flipped
 of `privileged_obs_buf` and turning them off would change the observation width
 and silently break the checkpoint.
 
+**Collision** is `play_plan.py`'s geometric test, not a margin threshold: a
+timestep collides when **any** robot rigid body is within `r_obs + 0.03` m of an
+obstacle axis in XY *and* at or below the cylinder top (`obstacle_z + 0.3`)
+within the same tolerance. That is how your own policy's numbers were produced,
+so E1's rows are comparable to Table 2 rather than merely internally consistent.
+Rate pools env-timesteps, matching `_write_collision_summary`.
+
+The margin-based `min_cbf_h < -0.05` is kept as a **secondary proximity**
+column (`n_proximity_steps`), reported separately and never as the headline.
+Worth knowing why they differ: `h = dist - 2*r_obs - 0.35` measures base-to-
+obstacle-*centre* in 3-D, and the stored obstacle z is ground level while the
+base rides at ~0.3 m, so `h` crosses -0.05 at roughly 0.37 m of real clearance.
+It counts near-misses; the geometric test counts contact.
+
 **Fall definition** (one definition, both branches): terminal base tilt past
 60° (`projected_gravity_z > −0.5`) **or** base height below 0.15 m above its
 terrain cell, **or** the simulator's own hard flag. The repo's own `self.fall`

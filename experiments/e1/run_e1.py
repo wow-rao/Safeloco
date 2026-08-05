@@ -162,6 +162,8 @@ def main():
         k_samples=ARGS.k_samples, m_steps=ARGS.m_steps,
         grad_normalize=ARGS.grad_normalize, filter_seed=ARGS.filter_seed,
         terrain=ARGS.eval_terrain, dr_mode=ARGS.dr,
+        collision_metric=("geometric_link_cylinder"
+                          if collector.collision_geometry else "sv_proxy"),
         n_episodes=len(records), eval_envs=ARGS.eval_envs,
         terrain_seed=EC.TERRAIN_SEED, cmd_lin_vel_x=EC.EVAL_CMD_LIN_VEL_X,
         action_scale=float(env_cfg.control.action_scale),

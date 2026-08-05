@@ -271,11 +271,58 @@ class PolicyRuntime(object):
 
 
 # ---------------------------------------------------------------------------
+# Collision detection
+# ---------------------------------------------------------------------------
+
+def link_obstacle_collision(body_pos, obstacle_pos, obstacle_radii,
+                            obstacle_mask, has_obstacles,
+                            cylinder_height=M.CYLINDER_HEIGHT,
+                            tol=M.BODY_COLLISION_TOL):
+    """[E] bool -- does any robot link intersect any obstacle cylinder?
+
+    Transcribed from `legged_gym/scripts/play_plan.py`, which is how the
+    paper's own collision numbers were computed.  Keeping it identical is what
+    makes E1's rows comparable to Table 2 rather than merely internally
+    consistent.
+
+    A link collides when it is within `r_obs + tol` of the obstacle axis in XY
+    *and* sits at or below the cylinder top (`obstacle_z + cylinder_height`)
+    within the same tolerance.  Every rigid body counts, so this is real
+    leg-environment contact -- not the base-only margin `h`.
+
+    Shapes: body_pos [E, B, 3], obstacle_pos [E, O, 3], obstacle_radii [E],
+    obstacle_mask [E, O], has_obstacles [E].
+    """
+    body_xy = body_pos[:, :, :2].unsqueeze(2)            # [E, B, 1, 2]
+    obs_xy = obstacle_pos[:, :, :2].unsqueeze(1)         # [E, 1, O, 2]
+    xy_dist = torch.norm(body_xy - obs_xy, dim=-1)       # [E, B, O]
+
+    obs_top_z = obstacle_pos[:, :, 2] + cylinder_height  # [E, O]
+    z_ok = body_pos[:, :, 2].unsqueeze(2) <= (obs_top_z.unsqueeze(1) + tol)
+
+    touching = (
+        (xy_dist < obstacle_radii.unsqueeze(1).unsqueeze(2) + tol)
+        & z_ok
+        & obstacle_mask.unsqueeze(1)
+        & has_obstacles.unsqueeze(1).unsqueeze(2)
+    )
+    return touching.any(dim=1).any(dim=1)
+
+
+def env_has_collision_geometry(env):
+    """play_plan.py's own precondition check, kept verbatim in spirit."""
+    return all(hasattr(env, a) for a in
+               ("obstacle_positions", "obstacle_radii", "has_obstacles",
+                "obstacle_mask", "rigid_body_pos"))
+
+
+# ---------------------------------------------------------------------------
 # Per-episode accumulation
 # ---------------------------------------------------------------------------
 
 _ACC_FIELDS = [
-    "n_steps", "n_collision_steps", "n_viol_steps", "return", "vel_err_sum",
+    "n_steps", "n_collision_steps", "n_proximity_steps",
+    "n_viol_steps", "return", "vel_err_sum",
     "lat_vel_sum", "h_sum", "h_min", "activation_steps", "target_miss_steps",
     "trigger_steps", "sum_dnorm_inf", "max_dnorm_inf", "sum_dnorm_l2",
     "q_gap_sum", "q_gap_n", "peak_yaw", "peak_jerk", "handoffs",
@@ -336,6 +383,14 @@ class EvalCollector(object):
         self.action_scale = float(env.cfg.control.action_scale)
         self.dt = float(env.dt)
 
+        self.collision_geometry = env_has_collision_geometry(env)
+        if not self.collision_geometry:
+            print("[eval] WARNING: env is missing obstacle_positions / "
+                  "obstacle_radii / has_obstacles / obstacle_mask / "
+                  "rigid_body_pos. Falling back to `safety_value < -0.05` as a "
+                  "collision proxy -- these numbers are NOT comparable with "
+                  "the paper's. Recorded as collision_metric in the manifest.")
+
         # Hard joint limits, recovered from the softened ones the env stores.
         soft = float(getattr(env.cfg.rewards, "soft_dof_pos_limit", 1.0))
         lo, hi = M.hard_dof_limits(env.dof_pos_limits[:, 0],
@@ -348,6 +403,19 @@ class EvalCollector(object):
         near = ((q - self.dof_lo.unsqueeze(0)) < M.JOINT_VIOL_MARGIN) | \
                ((self.dof_hi.unsqueeze(0) - q) < M.JOINT_VIOL_MARGIN)
         return near.any(dim=1)
+
+    def _collision(self):
+        """Geometric link-vs-cylinder contact, play_plan.py's definition."""
+        if not self.collision_geometry:
+            # play_plan.py's fallback. Recorded in the manifest as
+            # `collision_metric` so a CSV produced this way can never be
+            # mistaken for the geometric one.
+            return self.env.safety_values.to(self.env.device) < \
+                M.COLLISION_H_THRESH
+        env = self.env
+        return link_obstacle_collision(
+            env.rigid_body_pos, env.obstacle_positions, env.obstacle_radii,
+            env.obstacle_mask, env.has_obstacles)
 
     def _contact_bucket(self):
         f = self.env.contact_forces[:, self.env.feet_indices, 2]
@@ -453,9 +521,13 @@ class EvalCollector(object):
             critic_obs = privileged_obs if privileged_obs is not None else obs
 
             # ---- post-step transition metrics (pre-reset values) ---------
+            # `rigid_body_pos` is a view on the sim's rigid-body tensor, which
+            # reset_idx does not rewrite (only root_states and dof_state are),
+            # so like `cbf_h_min` it still holds the pre-reset pose here.
             h = infos["cbf_h_min"].to(env.device)
             self.acc.add("n_steps", torch.ones_like(live), live)
-            self.acc.add("n_collision_steps", h < M.COLLISION_H_THRESH, live)
+            self.acc.add("n_collision_steps", self._collision(), live)
+            self.acc.add("n_proximity_steps", h < M.COLLISION_H_THRESH, live)
             self.acc.add("return", rews.to(env.device), live)
             self.acc.add("h_sum", h, live)
             self.acc.add_min("h_min", h, live)
@@ -507,6 +579,7 @@ class EvalCollector(object):
                 "n_steps": int(a["n_steps"][j]),
                 "n_collision_steps": int(a["n_collision_steps"][j]),
                 "collided": int(a["n_collision_steps"][j] > 0),
+                "n_proximity_steps": int(a["n_proximity_steps"][j]),
                 "n_viol_steps": int(a["n_viol_steps"][j]),
                 "return": a["return"][j],
                 "vel_err": a["vel_err_sum"][j] / n,
@@ -621,7 +694,10 @@ def write_manifest(path, **fields):
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics.py")))
     blob.setdefault("seed_file_sha", S.file_hash())
     blob.setdefault("thresholds", {
-        "collision_h_thresh": M.COLLISION_H_THRESH,
+        "collision": "geometric link-vs-cylinder (play_plan.py)",
+        "cylinder_height": M.CYLINDER_HEIGHT,
+        "body_collision_tol": M.BODY_COLLISION_TOL,
+        "proximity_h_thresh": M.COLLISION_H_THRESH,
         "joint_viol_margin": M.JOINT_VIOL_MARGIN,
         "fall_tilt_proj_grav_z": M.FALL_TILT_PROJ_GRAV_Z,
         "fall_height": M.FALL_HEIGHT,

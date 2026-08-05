@@ -103,6 +103,7 @@ def summarise(run_id, run):
     row["fall"] = ST.wilson_ci(*M.fall_rate(recs))
     row["collision"] = ST.wilson_ci(*M.collision_rate(recs))
     row["eps_w_coll"] = ST.wilson_ci(*M.eps_with_collision(recs))
+    row["proximity"] = ST.wilson_ci(*M.proximity_rate(recs))
     row["activation"] = ST.wilson_ci(*M.activation_rate(recs))
     row["target_miss"] = ST.wilson_ci(*M.target_miss_rate(recs))
     row["trigger"] = ST.wilson_ci(
@@ -465,15 +466,17 @@ def main():
         "\n\n*Table R1a. E1, deployment-time joint-space projection (variant A "
         "sampling projection unless noted), corridor, N = {} episodes per row "
         "on the shared eval seed list, domain randomisation {}. Rates carry "
-        "Wilson 95% CIs; per-episode means carry +/- std. Collision = "
-        "timesteps with min_cbf_h < {}; fall = terminal base tilt beyond 60 "
-        "deg or base height below {} m (one definition across both branches). "
-        "Episodes end at their fall, so no post-fall timesteps enter any "
-        "denominator. Reference: ours 4.4% collision / 33.9 return / 0.085 "
-        "m/s vel err.*\n").format(
+        "Wilson 95% CIs; per-episode means carry +/- std. **Collision** is the "
+        "geometric link-vs-cylinder test used for the paper's own numbers "
+        "(any robot rigid body within r_obs + {} m of an obstacle axis in XY "
+        "and at or below the cylinder top), pooled over env-timesteps; fall = "
+        "terminal base tilt beyond 60 deg or base height below {} m (one "
+        "definition across both branches). Episodes end at their fall, so no "
+        "post-fall timesteps enter any denominator. Reference: ours 4.4% "
+        "collision / 33.9 return / 0.085 m/s vel err.*\n").format(
             len(runs[unf_id]["records"]),
             runs[unf_id]["manifest"].get("dr_mode", "?"),
-            M.COLLISION_H_THRESH, M.FALL_HEIGHT)
+            M.BODY_COLLISION_TOL, M.FALL_HEIGHT)
 
     with open(args.out + ".md", "w") as f:
         f.write("# Table R1a -- E1 joint-space projection (collision)\n\n")
@@ -497,9 +500,18 @@ def main():
                     diagnostics["max_sweep_lat_vel"], PI_NOM_LAT_VEL_REF,
                     M.OURS_MEAN_LAT_VEL,
                     diagnostics["no_emergent_sidestepping"]))
+        f.write("\n### Proximity (secondary; `min_cbf_h` < {})\n\n".format(
+            M.COLLISION_H_THRESH))
+        f.write("Reported next to the geometric rate so the two are never "
+                "conflated. The margin `h = dist - 2*r_obs - 0.35` is "
+                "base-to-obstacle-centre in 3-D, so it crosses this threshold "
+                "at roughly 0.37 m of real clearance -- a near-miss counter.\n\n")
+        for r in [unf_row] + sweep:
+            label = r.get("_label") or "eps = {:g}".format(r["epsilon"])
+            f.write("- {}: {}\n".format(label, ST.fmt_rate(*r["proximity"])))
         if qsafe_report:
             b = qsafe_report.get("battery", {})
-            f.write("- Q-hat battery: rho = {:.3f}, AUROC = {:.3f}, "
+            f.write("\n- Q-hat battery: rho = {:.3f}, AUROC = {:.3f}, "
                     "baseline AUROC = {:.3f}\n".format(
                         b.get("spearman_rho_q", float("nan")),
                         b.get("auroc_q_collision20", float("nan")),

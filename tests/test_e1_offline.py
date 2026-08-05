@@ -207,6 +207,7 @@ def synth_run(path, run_id, variant, eps, n, coll_p, fall_p, ret_mu,
             epsilon_or_alpha=("" if eps is None else eps),
             seed=1, episode_idx=i, terrain="corridor",
             collided=int(ncoll > 0), n_collision_steps=ncoll,
+            n_proximity_steps=min(steps, int(ncoll * 2.5)),
             n_viol_steps=0, n_steps=steps, fell=int(fell),
             **{"return": rng.gauss(ret_mu, 4.0)},
             vel_err=0.08, mean_lat_vel=lat, mean_h=0.4, min_h=-0.1,
@@ -424,6 +425,59 @@ def test_argv_passthrough():
           and "self.wm_config = parser.parse_args()" not in src)
 
 
+def test_collision_geometry_if_torch():
+    """The collision predicate, transcribed from play_plan.py.  A link
+    collides when it is within r_obs + tol of an obstacle axis in XY *and* at
+    or below the cylinder top."""
+    print("\n[collision geometry]")
+    try:
+        import torch
+    except ImportError:
+        print("  SKIP  torch not installed in this environment")
+        return
+    from safeloco_eval.eval_common import link_obstacle_collision
+
+    r, tol, hgt = 0.15, M.BODY_COLLISION_TOL, M.CYLINDER_HEIGHT
+    obs = torch.tensor([[[0.0, 0.0, 0.0]]])          # one cylinder at origin
+    rad = torch.tensor([r])
+    mask = torch.tensor([[True]])
+    has = torch.tensor([True])
+
+    def hit(x, y, z, mask=mask, has=has):
+        body = torch.tensor([[[x, y, z]]])
+        return bool(link_obstacle_collision(body, obs, rad, mask, has)[0])
+
+    check("link on the axis, low, collides", hit(0.0, 0.0, 0.05))
+    check("link far away does not", not hit(1.0, 0.0, 0.05))
+    check("just inside r+tol collides", hit(r + tol - 1e-3, 0.0, 0.05))
+    check("just outside r+tol does not", not hit(r + tol + 1e-3, 0.0, 0.05))
+    check("stepping over the top does not collide", not hit(0.0, 0.0, hgt + 0.1),
+          "z above cylinder top + tol")
+    check("at the top within tol still collides", hit(0.0, 0.0, hgt))
+    check("masked-out obstacle is ignored",
+          not hit(0.0, 0.0, 0.05, mask=torch.tensor([[False]])))
+    check("env with no obstacles never collides",
+          not hit(0.0, 0.0, 0.05, has=torch.tensor([False])))
+
+    # any-link semantics: one colliding foot is enough, and it must not be
+    # masked out by the other links being clear.
+    body = torch.tensor([[[2.0, 2.0, 0.3], [0.0, 0.0, 0.05], [3.0, 3.0, 0.3]]])
+    check("any link colliding flags the timestep",
+          bool(link_obstacle_collision(body, obs, rad, mask, has)[0]))
+
+    # Vectorised over envs and obstacles, with padding.
+    obs2 = torch.tensor([[[0.0, 0.0, 0.0], [5.0, 5.0, 0.0]],
+                         [[0.0, 0.0, 0.0], [5.0, 5.0, 0.0]]])
+    rad2 = torch.tensor([r, r])
+    mask2 = torch.tensor([[True, False], [True, False]])   # 2nd is padding
+    has2 = torch.tensor([True, True])
+    body2 = torch.tensor([[[5.0, 5.0, 0.05]],      # only the padded obstacle
+                          [[0.0, 0.0, 0.05]]])     # the real one
+    out = link_obstacle_collision(body2, obs2, rad2, mask2, has2)
+    check("padded obstacles do not produce phantom collisions",
+          not bool(out[0]) and bool(out[1]), str(out.tolist()))
+
+
 def test_qsafe_helpers_if_torch():
     print("\n[qsafe helpers]")
     try:
@@ -475,6 +529,7 @@ def main():
     test_seeds()
     test_argv_passthrough()
     test_verdict_pipeline()
+    test_collision_geometry_if_torch()
     test_qsafe_helpers_if_torch()
     print("\n" + "=" * 70)
     if FAILURES:

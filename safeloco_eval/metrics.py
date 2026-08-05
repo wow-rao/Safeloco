@@ -14,10 +14,25 @@ import math
 # Thresholds
 # --------------------------------------------------------------------------
 
-#: A timestep counts as a *collision* when the raw spatial margin drops below
-#: this (Table 4's collision-violation threshold).  Deliberately `min_cbf_h`
-#: and **not** `safety_value`: the latter is the rate-augmented
-#: `sv = 0.3*h_dot + h` and goes negative on approach without any contact.
+#: **Collision** is a geometric link-vs-cylinder intersection test, matching
+#: `legged_gym/scripts/play_plan.py` -- the definition the paper's own numbers
+#: were produced under, so E1's rows are directly comparable to them.
+#:
+#: A timestep collides when **any** robot rigid body sits within
+#: `obstacle_radius + BODY_COLLISION_TOL` of an obstacle axis in XY, **and**
+#: that body is at or below the cylinder's top (`obstacle_z + CYLINDER_HEIGHT`)
+#: within the same tolerance.  All links, not just the base: this is real
+#: leg-environment contact, not a proximity proxy.
+CYLINDER_HEIGHT = 0.3
+BODY_COLLISION_TOL = 0.03
+
+#: Secondary *proximity* diagnostic, reported alongside but never as the
+#: headline: `min_cbf_h < COLLISION_H_THRESH`, the raw spatial margin against
+#: Table 4's violation threshold.  Uses `min_cbf_h` and **not** `safety_value`
+#: -- the latter is the rate-augmented `sv = 0.3*h_dot + h` and goes negative on
+#: approach with no proximity at all.  Note `h = dist - 2*r_obs - 0.35` measures
+#: base-to-obstacle-centre in 3-D, so it crosses this threshold at roughly
+#: 0.37 m of real clearance; it is a near-miss counter, not contact.
 COLLISION_H_THRESH = -0.05
 
 #: A timestep counts as a *joint violation* when any joint sits within this
@@ -67,6 +82,8 @@ EPISODE_FIELDS = [
     # --- termination diagnostics (so `fell` is recomputable post hoc) ----
     "term_timeout", "term_fall_flag", "term_vel_violate", "term_contact",
     "term_proj_grav_z", "term_base_z_rel", "term_base_vel_z",
+    # --- secondary proximity diagnostic ---------------------------------
+    "n_proximity_steps",
     # --- E1 filter diagnostics ------------------------------------------
     "trigger_steps", "sum_dnorm_inf", "max_dnorm_inf", "sum_dnorm_l2",
     "mean_q_gap", "n_q_gap",
@@ -102,8 +119,9 @@ def is_fall(rec):
 
 
 def collision_rate(recs):
-    """Collision timesteps / total timesteps, pooled over episodes (the
-    paper's Table 2 convention: 13.9% / 4.4%).  Returns (k, n)."""
+    """Collision env-timesteps / total env-timesteps, pooled over episodes --
+    the convention `play_plan.py::_write_collision_summary` uses and the one
+    behind Table 2's 13.9% / 4.4%.  Returns (k, n)."""
     k = sum(int(r["n_collision_steps"]) for r in recs)
     n = sum(int(r["n_steps"]) for r in recs)
     return k, n
@@ -111,6 +129,15 @@ def collision_rate(recs):
 
 def eps_with_collision(recs):
     return sum(1 for r in recs if int(r["n_collision_steps"]) > 0), len(recs)
+
+
+def proximity_rate(recs):
+    """Secondary: timesteps with `min_cbf_h < COLLISION_H_THRESH`, the margin
+    proxy.  Reported next to the geometric rate so the two are never confused
+    and so threshold sensitivity is visible."""
+    k = sum(int(r.get("n_proximity_steps", 0) or 0) for r in recs)
+    n = sum(int(r["n_steps"]) for r in recs)
+    return k, n
 
 
 def fall_rate(recs):
