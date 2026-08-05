@@ -182,7 +182,8 @@ class WMPRunner:
         """Zero the per-iteration training-filter diagnostics."""
         self.e2_diag = {"steps": 0, "filtered_steps": 0,
                         "sum_dnorm_inf": 0.0, "sum_kl": 0.0,
-                        "clipped_steps": 0, "sum_clip_excess": 0.0}
+                        "clipped_steps": 0, "sum_clip_excess": 0.0,
+                        "triggered_steps": 0, "target_miss_steps": 0}
 
     E2_WM_KEYS = ("model_loss", "dyn_loss", "rep_loss", "image_loss", "reward_loss")
 
@@ -209,15 +210,28 @@ class WMPRunner:
             "mean_dnorm_inf": d["sum_dnorm_inf"] / steps,
             "frac_clipped": d["clipped_steps"] / steps,
             "mean_clip_excess": d["sum_clip_excess"] / steps,
+            "frac_triggered": d["triggered_steps"] / steps,
+            "target_miss_rate": (d["target_miss_steps"]
+                                 / max(d["filtered_steps"], 1)),
             "filter_steps_seen": d["steps"],
         }
         for k in self.E2_WM_KEYS:
             v = (wm_metrics or {}).get(k)
             row["wm_" + k] = float(np.mean(v)) if v is not None else ""
 
+        # An existing file whose header does not match these fields would take
+        # the new values positionally under the old column names -- silent
+        # corruption that survives into the analysis.  Rotate it aside instead.
+        fields = list(row.keys())
+        if os.path.exists(self.e2_diag_path):
+            with open(self.e2_diag_path) as fh:
+                first = fh.readline().strip()
+            if first and first.split(",") != fields:
+                os.replace(self.e2_diag_path, self.e2_diag_path + ".mismatched")
+
         new = not os.path.exists(self.e2_diag_path)
         with open(self.e2_diag_path, "a", newline="") as fh:
-            w = _csv.DictWriter(fh, fieldnames=list(row.keys()))
+            w = _csv.DictWriter(fh, fieldnames=fields)
             if new:
                 w.writeheader()
             w.writerow(row)
@@ -262,13 +276,18 @@ class WMPRunner:
             else:
                 s_feat, trigger = None, None
 
-            a_exec, _info = self.train_filter.apply(a_pol, s_feat, trigger)
+            a_exec, finfo = self.train_filter.apply(a_pol, s_feat, trigger)
 
             # Displacement is measured against the clipped action: that is the
             # action the env would have run unfiltered, so this isolates what
             # the filter changed from what clipping was going to change anyway.
             delta = a_exec - a_pol
-            dnorm_inf = delta.abs().amax(dim=-1)
+            # Report displacement in radians, as E1 does: the filter works in
+            # raw action units and converts with action_scale, so leaving it
+            # raw here would make ||da|| look 1/action_scale times smaller
+            # than the epsilon it is supposed to be compared against.
+            scale = float(getattr(self.train_filter, "action_scale", 1.0))
+            dnorm_inf = delta.abs().amax(dim=-1) * scale
             n = actions.shape[0]
             # KL between the policy's Gaussian recentred at the executed action
             # and at the sampled one: 0.5 * sum(((a_exec - a_samp) / sigma)^2).
@@ -287,6 +306,13 @@ class WMPRunner:
             # from a crash.
             self.e2_diag["clipped_steps"] += int((clip_excess > 0).sum().item())
             self.e2_diag["sum_clip_excess"] += float(clip_excess.sum().item())
+            # Target-miss is what says whether the filter is enforcing
+            # anything: a step where it fired but no candidate cleared the
+            # Q_hat margin is a step where it moved the action without
+            # improving predicted safety.  E1's convention is
+            # target_miss_steps / activation_steps.
+            self.e2_diag["triggered_steps"] += int(finfo["triggered"].sum().item())
+            self.e2_diag["target_miss_steps"] += int(finfo["target_miss"].sum().item())
 
             if self.train_store_executed:
                 # Contrast run: treat the filtered action as the behaviour
