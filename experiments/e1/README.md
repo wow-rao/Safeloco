@@ -4,8 +4,9 @@ Implements `experiment_protocol_phased.md` §3 (E1), the §2 Q̂_safe constructi
 it depends on, and the §1.1 shared-invariant machinery, against the actual
 Safeloco code (`viploco_codebase_addendum.md` §3.1–3.2).
 
-Nothing here trains a policy. π_nom is frozen; the filter sits between
-`act_inference(...)` and `env.step(...)`.
+E1 itself trains no policy: π_nom is frozen and the filter sits between
+`act_inference(...)` and `env.step(...)`. But with no surviving runs, π_nom has
+to be trained first — `train_policy.py` does that, and it is the dominant cost.
 
 ---
 
@@ -20,6 +21,7 @@ Nothing here trains a policy. π_nom is frozen; the filter sits between
 | `safeloco_eval/filters.py` | E1-A sampling projection, E1-B gradient projection (J1's clamp lands here in Phase 2) |
 | `safeloco_eval/qsafe.py` | Q̂_safe / V̂_safe, safety-return targets, collision labels |
 | `safeloco_eval/seeds.py` + `eval_seeds.json` | the shared 1,000-episode seed list |
+| `experiments/e1/train_policy.py` | train π_nom / π_rs / π_ours from scratch with the right config deltas |
 | `experiments/e1/collect_qsafe_data.py` | roll out π_nom / π_rs → Q̂ training buffers |
 | `experiments/e1/train_qsafe.py` | offline Q̂ fit + the §2 validation battery |
 | `experiments/e1/run_e1.py` | one sweep point → per-episode CSV + manifest |
@@ -43,16 +45,76 @@ not at all. Behaviour is otherwise unchanged.
 python tests/test_e1_offline.py
 ```
 
-**1. Set the pinned π_nom run.** This is the §1.1 invariant — one checkpoint,
-hash recorded, and the *same* one on the joint-limit branch later.
+**1. Train π_nom.** With no surviving runs this is step one, and it is the
+single biggest cost in Phase 1 — roughly a GPU-day on top of the protocol's
+2–3 day estimate, which assumed π_nom already existed.
 
 ```bash
-export PI_NOM_RUN=<run dir name under logs/go1_viploco_warp_v5/>
-export PI_NOM_CKPT=-1          # or a specific iteration number
-export PI_RS_RUN=<reward-shaping run>   # optional but recommended (see below)
+python experiments/e1/train_policy.py --policy pi_nom \
+    --task go1_amp --headless --max_iterations 10000
+# -> logs/go1_viploco_warp_v5/pi_nom/model_*.pt  (+ policy_config.json)
 ```
 
-**1b. Smoke-test the plumbing first** — 5 minutes, and it catches every path,
+`--policy pi_nom` sets `algorithm.safety_coef = 0`, which makes
+`AMPPPO.update` skip the entire safety branch (`amp_ppo.py:350`) — no safety
+surrogate, no safety-critic update, no damped null-space projection. The reward
+is untouched (`safety_value` is not in `rewards.scales`, so
+`_reward_safety_value` is never registered). The world model trains inside the
+same run and lands in the same checkpoint, so there is no separate world-model
+step.
+
+**Why 10,000 iterations and not `train.py`'s hardcoded 2,000.** The go1 config
+ramps the `feet_edge` penalty from 0.1 to 1.0 across iterations 4,000→10,000
+(`go1_amp_config.py:239`). A 2,000-iteration policy sits at the *start* of that
+curriculum and is not the policy the config was designed to produce. It also
+matters for E1 specifically: the verdict rule measures the filter's fall rate
+*against unfiltered π_nom's*, so an under-trained π_nom that already falls
+often compresses exactly the signal E1 is looking for.
+
+**2. Gate on π_nom's quality before spending anything else.** Do not skip this
+— every later number is relative to this row.
+
+```bash
+python experiments/e1/run_e1.py --task go1_amp --headless \
+    --load_run pi_nom --filter none \
+    --n_episodes 250 --eval_envs 250 --out_dir logs/e1/precheck
+```
+
+Look for: fall rate well under ~15%, return clearly positive, `vel_err` small
+relative to the 0.6 m/s command, and a **non-trivial collision rate** (the
+corridor should actually be challenging it — near-0% means the obstacles aren't
+being hit and there is nothing for a collision filter to improve). If fall rate
+is high or return is near zero, train longer and re-gate rather than proceeding.
+
+**3. Pin it.** This is the §1.1 invariant — one checkpoint, hash recorded, and
+the *same* one on the joint-limit branch later. The hash goes into every run
+manifest automatically; record it in App. A too.
+
+```bash
+export PI_NOM_RUN=pi_nom
+export PI_NOM_CKPT=-1          # or a specific iteration number
+export PI_RS_RUN=               # leave empty -- see below
+```
+
+**On π_rs: skip it for E1.** The protocol wants Q̂ trained on mixed π_nom + π_rs
+substrates for action coverage, and lists a π_rs sweep point as optional. But
+π_rs costs another GPU-day, and the coverage problem it addresses is handled
+more directly by the injected action noise (below), which perturbs actions
+*off* any policy's manifold rather than sampling a second manifold. For E1 the
+trade isn't worth a day. Note the deviation in App. J. π_rs does become
+genuinely necessary for E2, where it is the Reward-only row — train it then:
+
+```bash
+python experiments/e1/train_policy.py --policy pi_rs --rs_weight 1.0 \
+    --task go1_amp --headless --max_iterations 10000
+```
+
+**π_ours is not needed for E1.** The verdict rule quotes the paper's own
+numbers for it (4.4% collision / 33.9 return / 0.085 m/s), so nothing in this
+experiment requires retraining the full method. `--policy pi_ours` exists in the
+same script for when the Pareto plots need it.
+
+**4. Smoke-test the E1 plumbing** — 5 minutes, and it catches every path,
 shape and import problem before you commit 4 hours. Run from the repo root
 (the world-model config loader resolves `dreamer/configs.yaml` relative to
 `sys.argv[0]`'s grandparent, so the scripts must stay three levels deep and be
@@ -79,7 +141,7 @@ The numbers will be meaningless at 16 episodes; what you're checking is that
 all five stages complete, the trust-region assertion never fires, and the
 unfiltered row reports 0% activation. Then `rm -rf logs/e1_smoke`.
 
-**2. Run the pipeline** (one RTX-5000-Ada-class GPU; ≈ 4–6 h total):
+**5. Run the E1 pipeline** (≈ 4–6 h once π_nom exists):
 
 ```bash
 ./experiments/e1/sweep_e1.sh all

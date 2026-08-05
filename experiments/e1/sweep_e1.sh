@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # E1 -- deployment-time joint-space projection, collision.  Full pipeline.
 #
-# Stages (run them individually or `all`):
+# Stages (run them individually, or `all` for everything after pretrain):
+#   pretrain  train pi_nom from scratch -- ~a GPU-day, NOT part of `all`
+#   precheck  evaluate unfiltered pi_nom  <-- GATE on policy quality, read it
 #   collect   roll out pi_nom (and optionally pi_rs) -> Q_safe training buffers
 #   train     fit Q_safe offline + validation battery   <-- GATE, read it
 #   sweep     the epsilon sweep + variants + ablations
@@ -14,9 +16,10 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 # ---- configuration -------------------------------------------------------
-PI_NOM_RUN="${PI_NOM_RUN:?set PI_NOM_RUN to the pinned pi_nom run directory name under logs/<experiment_name>/}"
+PI_NOM_RUN="${PI_NOM_RUN:-pi_nom}"        # run dir under logs/<experiment_name>/
 PI_NOM_CKPT="${PI_NOM_CKPT:--1}"          # -1 = last checkpoint in that run
 PI_RS_RUN="${PI_RS_RUN:-}"                # optional reward-shaping run
+TRAIN_ITERS="${TRAIN_ITERS:-10000}"       # pretrain only; past the feet_edge curriculum
 TASK="${TASK:-go1_amp}"
 DEVICE="${DEVICE:-cuda:0}"
 OUT="${OUT:-logs/e1}"
@@ -32,6 +35,26 @@ DR="${DR:-off}"
 COMMON="--task ${TASK} --headless --sim_device ${DEVICE} --rl_device ${DEVICE}"
 SWEEP_DIR="${OUT}/sweep"
 QSAFE="${OUT}/qsafe"
+
+stage_pretrain() {
+  echo "=== [E1 stage 0/4] training pi_nom from scratch (~a GPU-day) ==="
+  python experiments/e1/train_policy.py --policy pi_nom \
+    --task "${TASK}" --headless --sim_device "${DEVICE}" \
+    --rl_device "${DEVICE}" --run_name "${PI_NOM_RUN}" \
+    --max_iterations "${TRAIN_ITERS}"
+}
+
+stage_precheck() {
+  echo "=== [E1 gate] unfiltered pi_nom quality check ==="
+  python experiments/e1/run_e1.py ${COMMON} \
+    --load_run "${PI_NOM_RUN}" --checkpoint "${PI_NOM_CKPT}" \
+    --filter none --n_episodes 250 --eval_envs 250 \
+    --eval_terrain corridor --dr "${DR}" --out_dir "${OUT}/precheck"
+  echo
+  echo ">>> GATE: fall rate well under ~15%, return clearly positive, and a"
+  echo ">>> non-trivial collision rate. If pi_nom already falls often, the"
+  echo ">>> large-epsilon signal E1 measures is compressed -- train longer."
+}
 
 stage_collect() {
   echo "=== [E1 stage 1/4] collecting Q_safe buffers ==="
@@ -124,10 +147,14 @@ stage_analyze() {
 }
 
 case "${1:-all}" in
-  collect) stage_collect ;;
-  train)   stage_train ;;
-  sweep)   stage_sweep ;;
-  analyze) stage_analyze ;;
-  all)     stage_collect; stage_train; stage_sweep; stage_analyze ;;
-  *) echo "usage: $0 {collect|train|sweep|analyze|all}"; exit 1 ;;
+  pretrain) stage_pretrain ;;
+  precheck) stage_precheck ;;
+  collect)  stage_collect ;;
+  train)    stage_train ;;
+  sweep)    stage_sweep ;;
+  analyze)  stage_analyze ;;
+  # `all` deliberately excludes pretrain: it is a GPU-day and has its own gate.
+  all)      stage_collect; stage_train; stage_sweep; stage_analyze ;;
+  *) echo "usage: $0 {pretrain|precheck|collect|train|sweep|analyze|all}"
+     exit 1 ;;
 esac
