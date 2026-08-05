@@ -343,6 +343,87 @@ def test_verdict_pipeline():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _wm_parser():
+    """Same shape as WMPRunner._build_world_model's parser: six fixed flags
+    plus one argument per top-level key of dreamer/configs.yaml's `defaults`."""
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--headless", action="store_true", default=False)
+    p.add_argument("--task", default="go1_amp")
+    p.add_argument("--sim_device", default="cuda:0")
+    p.add_argument("--wm_device", default="None")
+    p.add_argument("--terrain", default="climb")
+    p.add_argument("--checkpoint", default=-1)
+    for key in ("horizon", "batch_size", "device", "units", "train_ratio"):
+        p.add_argument("--" + key, default=None)
+    return p
+
+
+def test_argv_passthrough():
+    """Three parsers read sys.argv on the way to a runner: this script's own,
+    legged_gym's get_args, and WMPRunner._build_world_model's.  The last one
+    knows only its six flags plus the dreamer config keys, so every legged_gym
+    flag has to survive it.  Regression test for `--rl_device`/`--run_name`/
+    `--max_iterations` aborting `_build_world_model`."""
+    print("\n[argv plumbing]")
+    import argparse
+    import contextlib
+    import io
+    from safeloco_eval.cli import parse_and_strip
+
+    cmdlines = {
+        "train_policy": [
+            "train_policy.py", "--policy", "pi_nom", "--task", "go1_amp",
+            "--headless", "--sim_device", "cuda:0", "--rl_device", "cuda:0",
+            "--run_name", "pi_nom", "--max_iterations", "2000"],
+        "run_e1": [
+            "run_e1.py", "--filter", "A", "--epsilon", "0.1", "--task",
+            "go1_amp", "--headless", "--sim_device", "cuda:0", "--rl_device",
+            "cuda:0", "--load_run", "pi_nom", "--checkpoint", "-1",
+            "--num_envs", "250", "--seed", "1"],
+    }
+    own = {"train_policy": [("--policy", str), ("--rs_weight", float)],
+           "run_e1": [("--filter", str), ("--epsilon", float)]}
+
+    saved = sys.argv
+    try:
+        for name, argv in cmdlines.items():
+            sys.argv = list(argv)
+            p = argparse.ArgumentParser(add_help=False)
+            for flag, typ in own[name]:
+                p.add_argument(flag, type=typ)
+            parse_and_strip(p)
+            check("{}: own flags stripped from argv".format(name),
+                  all(f not in sys.argv for f, _ in own[name]),
+                  " ".join(sys.argv))
+
+            cfg, unknown = _wm_parser().parse_known_args()
+            check("{}: world-model parser survives the CLI".format(name),
+                  cfg.task == "go1_amp" and cfg.sim_device == "cuda:0"
+                  and cfg.headless is True,
+                  "task={} dev={} headless={}".format(
+                      cfg.task, cfg.sim_device, cfg.headless))
+            check("{}: legged_gym flags reported unknown, not fatal".format(name),
+                  "--rl_device" in unknown)
+
+            # The same parser under parse_args (the pre-fix behaviour) aborts.
+            aborted = False
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    _wm_parser().parse_args()
+            except SystemExit:
+                aborted = True
+            check("{}: parse_args would have aborted (bug reproduced)".format(name),
+                  aborted)
+    finally:
+        sys.argv = saved
+
+    src = open(os.path.join(ROOT, "rsl_rl/runners/wmp_runner.py")).read()
+    check("wmp_runner uses parse_known_args",
+          "parser.parse_known_args()" in src
+          and "self.wm_config = parser.parse_args()" not in src)
+
+
 def test_qsafe_helpers_if_torch():
     print("\n[qsafe helpers]")
     try:
@@ -392,6 +473,7 @@ def main():
     test_metrics()
     test_sanity_checks()
     test_seeds()
+    test_argv_passthrough()
     test_verdict_pipeline()
     test_qsafe_helpers_if_torch()
     print("\n" + "=" * 70)

@@ -197,7 +197,14 @@ class WMPRunner:
         for key, value in sorted(defaults.items(), key=lambda x: x[0]):
             arg_type = tools.args_type(value)
             parser.add_argument(f"--{key}", type=arg_type, default=arg_type(value))
-        self.wm_config = parser.parse_args()
+        # parse_known_args, not parse_args: this parser only knows the six
+        # flags above plus dreamer/configs.yaml's keys, so every other
+        # legged_gym flag (--rl_device, --run_name, --load_run, --resume,
+        # --max_iterations, --num_envs, --seed, --experiment_name, and
+        # isaacgym's own --pipeline/--physx/...) is fatal to it under
+        # parse_args. Those belong to get_args and have already been consumed
+        # there; the world model should ignore them rather than reject them.
+        self.wm_config, _ = parser.parse_known_args()
         # allow world model and rl env on different device
         if (self.wm_config.wm_device != 'None'):
             self.wm_config.device = self.wm_config.wm_device
