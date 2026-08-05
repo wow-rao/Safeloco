@@ -258,6 +258,23 @@ def main():
     tr_idx, va_idx = all_idx[tr_mask], all_idx[va_mask]
     print("[qsafe] train rows {}  val rows {}".format(len(tr_idx), len(va_idx)))
 
+    if len(all_idx) == 0 or len(tr_idx) == 0 or len(va_idx) == 0:
+        max_ep = max((m.get("max_episode_length") or 0) for m in metas)
+        steps = max((m.get("steps") or 0) for m in metas)
+        raise SystemExit(
+            "\nNo usable rows: {} of {} collected steps are valid.\n\n"
+            "A step only becomes usable once its episode has *finished*: the "
+            "safety-return recursion runs backwards from the terminal step, "
+            "so a trailing episode that never ends has no target and is "
+            "dropped. If the collection window is shorter than an episode, "
+            "nothing finishes and everything is dropped.\n\n"
+            "This buffer collected {} steps against episodes of up to {} "
+            "steps.\n\nFix: re-run collect_qsafe_data.py with a larger "
+            "--collect_steps (comfortably more than {}), and make sure "
+            "--stagger_episodes is on (the default) so episodes finish "
+            "throughout the window rather than all at the end.".format(
+                int(valid.sum()), int(valid.numel()), steps, max_ep, max_ep))
+
     models = [train_one(data, tr_idx, meta, args, args.seed + i)
               for i in range(args.ensemble)]
     model = models[0]

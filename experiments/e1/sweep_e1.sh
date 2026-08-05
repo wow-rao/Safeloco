@@ -27,7 +27,8 @@ OUT="${OUT:-logs/e1}"
 N_EPISODES="${N_EPISODES:-1000}"
 EVAL_ENVS="${EVAL_ENVS:-250}"             # N_EPISODES should be a multiple
 COLLECT_ENVS="${COLLECT_ENVS:-256}"
-COLLECT_STEPS="${COLLECT_STEPS:-1000}"
+COLLECT_STEPS="${COLLECT_STEPS:-2000}"   # > max_episode_length (1000);
+                                          # see README on the validity mask
 EPOCHS="${EPOCHS:-30}"
 ALPHA="${ALPHA:-0.95}"                    # safety-return discount; see README
 ENSEMBLE="${ENSEMBLE:-3}"                 # 1 primary head + 2 control members

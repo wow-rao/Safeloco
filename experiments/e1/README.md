@@ -161,7 +161,7 @@ invoked from the root):
 
 ```bash
 python experiments/e1/collect_qsafe_data.py --task go1_amp --headless \
-    --load_run "$PI_NOM_RUN" --collect_envs 16 --collect_steps 60 \
+    --load_run "$PI_NOM_RUN" --collect_envs 16 --collect_steps 400 \
     --out logs/e1_smoke/buf
 python experiments/e1/train_qsafe.py --buffers logs/e1_smoke/buf \
     --out logs/e1_smoke/qsafe --epochs 2 --ensemble 1
@@ -179,6 +179,16 @@ python experiments/e1/analyze_e1.py --dir logs/e1_smoke/sweep \
 The numbers will be meaningless at 16 episodes; what you're checking is that
 all five stages complete, the trust-region assertion never fires, and the
 unfiltered row reports 0% activation. Then `rm -rf logs/e1_smoke`.
+
+`--collect_steps` has to comfortably exceed one episode. A step is only usable
+once its episode has **finished** — the safety-return recursion runs backwards
+from the terminal step, so a trailing episode that never ends has no target and
+is dropped. Episodes here run to 1001 steps (`max_episode_length = 1000`), and
+collection staggers the episode clocks at reset (as training's
+`init_at_random_ep_len` does) so episodes finish throughout the window instead
+of all at the end. `collect_qsafe_data.py` prints the episode-end count and
+warns if too few finished; `train_qsafe.py` refuses to train on an empty set
+rather than silently producing NaNs.
 
 **5. Run the E1 pipeline** (≈ 4–6 h once π_nom exists):
 

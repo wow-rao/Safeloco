@@ -52,6 +52,10 @@ def build_parser():
                    help="fraction of envs running the noisy behaviour policy; "
                         "0 reproduces the literal protocol")
     p.add_argument("--store_grid", type=int, default=1)
+    p.add_argument("--stagger_episodes", type=int, default=1,
+                   help="randomise initial episode clocks so episodes finish "
+                        "throughout the window instead of all at the end; "
+                        "mirrors training's init_at_random_ep_len")
     p.add_argument("--collect_dr", type=str, default="on",
                    choices=["off", "on"],
                    help="DR *on* by default here: the training distribution "
@@ -87,6 +91,16 @@ def main():
     obs, privileged_obs, _ = env.reset()
     critic_obs = privileged_obs if privileged_obs is not None else obs
     rt.reset(obs)
+
+    # Stagger the episode clocks, exactly as training does via
+    # `init_at_random_ep_len`.  Without this every env resets at step 0 and
+    # times out together at max_episode_length + 1, so a collection window
+    # shorter than an episode yields *no completed episodes at all* -- and a
+    # step is only usable once its episode has ended, because the
+    # safety-return recursion runs backwards from the terminal step.
+    if ARGS.stagger_episodes:
+        env.episode_length_buf = torch.randint_like(
+            env.episode_length_buf, high=int(env.max_episode_length))
 
     T, B = ARGS.collect_steps, env.num_envs
     store_grid = bool(ARGS.store_grid) and rt.grid_enabled
@@ -180,6 +194,9 @@ def main():
         "store_grid": store_grid,
         "collision_metric": ("geometric_link_cylinder" if has_geom
                              else "unavailable"),
+        "max_episode_length": int(env.max_episode_length),
+        "stagger_episodes": bool(ARGS.stagger_episodes),
+        "n_collision_steps": int(buf["collision"].sum()),
         "action_scale": float(env_cfg.control.action_scale),
         "clip_actions": clip_actions,
         "num_critic_obs": int(critic_obs.shape[1]),
@@ -190,8 +207,15 @@ def main():
     }
     with open(ARGS.out + ".meta.json", "w") as f:
         json.dump(meta, f, indent=2)
-    print("[collect] wrote {}.pt ({} episode ends)".format(
-        ARGS.out, meta["n_episode_ends"]))
+    n_ends = meta["n_episode_ends"]
+    print("[collect] wrote {}.pt ({} episode ends, {} collision steps)".format(
+        ARGS.out, n_ends, meta["n_collision_steps"]))
+    if n_ends < B:
+        print("[collect] WARNING: only {} episodes finished across {} envs in "
+              "{} steps. Steps whose episode never ends are dropped by "
+              "train_qsafe.py, so this buffer will train on little or "
+              "nothing. Episodes run up to {} steps -- raise --collect_steps."
+              .format(n_ends, B, T, int(env.max_episode_length)))
 
 
 if __name__ == "__main__":
