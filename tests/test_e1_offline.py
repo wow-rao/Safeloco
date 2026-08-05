@@ -507,6 +507,16 @@ def test_qsafe_helpers_if_torch():
     check("collision label does not cross a done", not bool(lab[1, 0]))
     check("collision label before the boundary is clean", not bool(lab[0, 0]))
 
+    # Same recursion driven by the geometric collision flag, which is what
+    # train_qsafe.py labels from when the buffer carries one.
+    from safeloco_eval.qsafe import events_within_horizon
+    hit = torch.tensor([[False], [False], [True], [False]])
+    lab2 = events_within_horizon(hit, done, horizon=5)
+    check("event labels match the margin-threshold path",
+          torch.equal(lab, lab2))
+    lab3 = events_within_horizon(hit, done, horizon=1)
+    check("horizon is respected", bool(lab3[2, 0]) and not bool(lab3[0, 0]))
+
     # Factorised first layer == an un-factorised Linear over [s; a].
     m = SafetyActionValue(num_critic_obs=8, num_actions=4, wm_feature_dim=6,
                           grid_enabled=False)

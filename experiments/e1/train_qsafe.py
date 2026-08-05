@@ -45,7 +45,8 @@ import torch
 from safeloco_eval import metrics as M
 from safeloco_eval import stats as ST
 from safeloco_eval.qsafe import (SafetyActionValue, compute_safety_returns,
-                                 collision_within_horizon)
+                                 collision_within_horizon,
+                                 events_within_horizon)
 
 RHO_THRESHOLD = 0.6      # §2 interpretation rule
 AUROC_THRESHOLD = 0.8
@@ -218,14 +219,31 @@ def main():
     meta = metas[0]
 
     # Collision-within-H labels, computed per buffer so they never cross an
-    # episode (or a buffer) boundary.
-    labels = torch.cat([
-        collision_within_horizon(b["min_cbf_h"], b["done"], COLLISION_HORIZON,
-                                 M.COLLISION_H_THRESH).reshape(-1)
-        for b in parts], 0)
+    # episode (or a buffer) boundary.  Label from the geometric collision flag
+    # when the buffer carries one, so the battery validates Q-hat against the
+    # same definition the E1 tables report.
+    label_source = ("geometric_link_cylinder"
+                    if all("collision" in b and bool(b["collision"].any())
+                           for b in parts) else "min_cbf_h_proxy")
+    if label_source == "geometric_link_cylinder":
+        labels = torch.cat([
+            events_within_horizon(b["collision"], b["done"],
+                                  COLLISION_HORIZON).reshape(-1)
+            for b in parts], 0)
+    else:
+        print("[qsafe] WARNING: buffers carry no geometric collision flag (or "
+              "it never fired); falling back to the min_cbf_h < {} proxy for "
+              "the AUROC labels. Re-collect with the current "
+              "collect_qsafe_data.py to label against the reported collision "
+              "metric.".format(M.COLLISION_H_THRESH))
+        labels = torch.cat([
+            collision_within_horizon(b["min_cbf_h"], b["done"],
+                                     COLLISION_HORIZON,
+                                     M.COLLISION_H_THRESH).reshape(-1)
+            for b in parts], 0)
 
     keys = ["critic_obs", "wm_feature", "action", "safety_return",
-            "safety_value", "min_cbf_h", "done", "valid", "grid"]
+            "safety_value", "min_cbf_h", "collision", "done", "valid", "grid"]
     data = flatten(parts, keys)
     data["label20"] = labels
     # `flatten` copies; release the source buffers before training so peak RAM
@@ -276,6 +294,7 @@ def main():
         "ensemble": args.ensemble, "seed": args.seed,
         "buffers": args.buffers, "buffer_meta": metas,
         "n_train_rows": int(len(tr_idx)), "n_val_rows": int(len(va_idx)),
+        "auroc_label_source": label_source,
         "delta_iqr": iqr, "delta": 0.05 * iqr,
         "battery": {
             "spearman_rho_q": rho,

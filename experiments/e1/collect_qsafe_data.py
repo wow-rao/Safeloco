@@ -100,9 +100,18 @@ def main():
         "action": torch.zeros(T, B, env.num_actions, dtype=torch.float16),
         "safety_value": torch.zeros(T, B, dtype=torch.float32),
         "min_cbf_h": torch.zeros(T, B, dtype=torch.float32),
+        # Geometric link-vs-cylinder collision, the same definition the E1
+        # tables report. The Q-hat AUROC battery labels from this, so the
+        # critic is validated against the metric it is meant to predict.
+        "collision": torch.zeros(T, B, dtype=torch.bool),
         "done": torch.zeros(T, B, dtype=torch.bool),
         "noisy": torch.zeros(B, dtype=torch.bool),
     }
+    has_geom = EC.env_has_collision_geometry(env)
+    if not has_geom:
+        print("[collect] WARNING: no obstacle/rigid-body tensors; the "
+              "collision field will stay all-False and train_qsafe.py will "
+              "fall back to the min_cbf_h proxy for its AUROC labels.")
     if store_grid:
         buf["grid"] = torch.zeros(T, B, *rt.grid_shape, dtype=torch.float16)
 
@@ -146,6 +155,10 @@ def main():
         buf["safety_value"][t] = env.safety_values.detach().float().cpu()
         buf["min_cbf_h"][t] = infos["cbf_h_min"].detach().float().cpu()
         buf["done"][t] = dones.bool().cpu()
+        if has_geom:
+            buf["collision"][t] = EC.link_obstacle_collision(
+                env.rigid_body_pos, env.obstacle_positions, env.obstacle_radii,
+                env.obstacle_mask, env.has_obstacles).cpu()
 
         rt.post_step(obs, infos, dones, reset_ids)
         if (t + 1) % 100 == 0:
@@ -165,6 +178,8 @@ def main():
         "dr_mode": ARGS.collect_dr,
         "collect_seed": ARGS.collect_seed,
         "store_grid": store_grid,
+        "collision_metric": ("geometric_link_cylinder" if has_geom
+                             else "unavailable"),
         "action_scale": float(env_cfg.control.action_scale),
         "clip_actions": clip_actions,
         "num_critic_obs": int(critic_obs.shape[1]),

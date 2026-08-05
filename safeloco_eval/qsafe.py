@@ -256,23 +256,34 @@ def compute_safety_returns(safety_values, dones, alpha, clamp_max=0.5,
     return out
 
 
-def collision_within_horizon(min_cbf_h, dones, horizon, thresh):
-    """Label [T, B]: does a collision (`min_cbf_h < thresh`) occur within
-    `horizon` steps, without crossing an episode boundary?  The positive class
-    for the Q-hat AUROC check.
+def events_within_horizon(hit, dones, horizon):
+    """Label [T, B]: does an event occur within `horizon` steps, without
+    crossing an episode boundary?  The positive class for the Q-hat AUROC
+    check, with `hit` = the per-step collision flag.
 
-    Implemented as a backward "steps until the next collision" recursion, with
-    the count reset to infinity across a terminal step so labels never leak
-    from one episode into the previous one.
+    Implemented as a backward "steps until the next event" recursion, with the
+    count reset to infinity across a terminal step so labels never leak from
+    one episode into the previous one.
     """
-    T = min_cbf_h.shape[0]
-    hit = (min_cbf_h < thresh)
+    T = hit.shape[0]
+    hit = hit.bool()
     INF = float(horizon) + 1.0
     out = torch.zeros_like(hit)
-    steps = torch.full_like(min_cbf_h[0], INF)   # steps-to-hit at t+1
+    steps = torch.full(hit.shape[1:], INF, dtype=torch.float,
+                       device=hit.device)                # steps-to-hit at t+1
     for t in reversed(range(T)):
         nxt = torch.where(dones[t].bool(), torch.full_like(steps, INF), steps)
         steps = torch.where(hit[t], torch.zeros_like(steps),
                             torch.clamp(nxt + 1.0, max=INF))
         out[t] = steps <= float(horizon)
     return out
+
+
+def collision_within_horizon(min_cbf_h, dones, horizon, thresh):
+    """`events_within_horizon` over the margin proxy `min_cbf_h < thresh`.
+
+    Fallback only: prefer labelling from the geometric collision flag that
+    `collect_qsafe_data.py` stores, so the Q-hat battery is validated against
+    the same collision definition the E1 tables report.
+    """
+    return events_within_horizon(min_cbf_h < thresh, dones, horizon)
