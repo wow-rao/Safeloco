@@ -181,7 +181,8 @@ class WMPRunner:
     def _e2_reset_diag(self):
         """Zero the per-iteration training-filter diagnostics."""
         self.e2_diag = {"steps": 0, "filtered_steps": 0,
-                        "sum_dnorm_inf": 0.0, "sum_kl": 0.0}
+                        "sum_dnorm_inf": 0.0, "sum_kl": 0.0,
+                        "clipped_steps": 0, "sum_clip_excess": 0.0}
 
     E2_WM_KEYS = ("model_loss", "dyn_loss", "rep_loss", "image_loss", "reward_loss")
 
@@ -206,6 +207,8 @@ class WMPRunner:
             "frac_filtered": d["filtered_steps"] / steps,
             "mean_kl_exec_sampled": d["sum_kl"] / steps,
             "mean_dnorm_inf": d["sum_dnorm_inf"] / steps,
+            "frac_clipped": d["clipped_steps"] / steps,
+            "mean_clip_excess": d["sum_clip_excess"] / steps,
             "filter_steps_seen": d["steps"],
         }
         for k in self.E2_WM_KEYS:
@@ -233,6 +236,23 @@ class WMPRunner:
             return actions
 
         with torch.no_grad():
+            # The filter clamps its *candidates* to +/- clip_actions but not
+            # the action handed to it, so it assumes a pre-clipped input --
+            # eval_common.EvalCollector clamps before calling apply().
+            # Training actions are raw Gaussian draws and routinely land
+            # outside the box; handing one over unclamped makes the filter
+            # measure its displacement against a point the environment would
+            # never have executed and trips the trust-region assertion.
+            # legged_robot.step clips identically, so clamping here changes
+            # nothing about what actually runs.
+            clip = float(getattr(self.train_filter, "clip_actions", 0.0))
+            if clip > 0:
+                a_pol = actions.clamp(-clip, clip)
+                clip_excess = (actions.abs().amax(dim=-1) - clip).clamp_min(0.0)
+            else:
+                a_pol = actions
+                clip_excess = torch.zeros(actions.shape[0], device=actions.device)
+
             if self.train_qsafe is not None:
                 s_feat = self.train_qsafe.state_features(
                     critic_obs.detach(),
@@ -242,9 +262,12 @@ class WMPRunner:
             else:
                 s_feat, trigger = None, None
 
-            a_exec, _info = self.train_filter.apply(actions, s_feat, trigger)
+            a_exec, _info = self.train_filter.apply(a_pol, s_feat, trigger)
 
-            delta = a_exec - actions
+            # Displacement is measured against the clipped action: that is the
+            # action the env would have run unfiltered, so this isolates what
+            # the filter changed from what clipping was going to change anyway.
+            delta = a_exec - a_pol
             dnorm_inf = delta.abs().amax(dim=-1)
             n = actions.shape[0]
             # KL between the policy's Gaussian recentred at the executed action
@@ -257,6 +280,13 @@ class WMPRunner:
             self.e2_diag["filtered_steps"] += int((dnorm_inf > 1e-6).sum().item())
             self.e2_diag["sum_dnorm_inf"] += float(dnorm_inf.sum().item())
             self.e2_diag["sum_kl"] += float(kl.sum().item())
+            # Training-health signal, independent of the filter: a policy
+            # whose raw samples sit far outside the action box is diverging,
+            # and under E2's sampled-vs-executed mismatch that can happen
+            # fast.  Worth seeing in the diagnostics rather than inferring it
+            # from a crash.
+            self.e2_diag["clipped_steps"] += int((clip_excess > 0).sum().item())
+            self.e2_diag["sum_clip_excess"] += float(clip_excess.sum().item())
 
             if self.train_store_executed:
                 # Contrast run: treat the filtered action as the behaviour

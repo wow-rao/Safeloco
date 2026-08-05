@@ -131,6 +131,27 @@ python tests/test_e2_offline.py      # verdict rule on synthetic worlds
 python tests/test_cone_constraint.py # the E2 prerequisite fix
 ```
 
+### 5. Actions are clamped before they reach the filter
+
+`ActionFilter.apply()` clamps its *candidates* to ±`clip_actions` but not the
+action it is handed, so its `‖Δa‖∞ ≤ ε` guarantee only holds for input already
+inside the box. At eval that is satisfied by `EvalCollector`; at training,
+actions are raw Gaussian draws and land outside the box routinely. Handing one
+over unclamped makes the filter measure its displacement against a point the
+environment would never have run — `a_pol = 66` against `clip_actions = 6`
+gives `(66−6)·0.25 = 15.0` and trips the trust-region assertion.
+
+The training hook therefore clamps first. `legged_robot.step` clips
+identically, so this changes nothing about what executes, and displacement is
+measured against the clamped action so the diagnostic isolates the filter from
+clipping. `tests/test_train_filter_contract.py` pins both halves.
+
+`train_diag.csv` also carries `frac_clipped` and `mean_clip_excess`: a policy
+whose raw samples sit far outside the action box is diverging, and under E2's
+sampled-vs-executed mismatch that can happen within a handful of iterations.
+That is a result if it survives, not just a nuisance — watch it rather than
+inferring it from a crash.
+
 ## What to check before believing the result
 
 - **`cone_constraint.py` must be fixed first.** Until the `d_safe`/`d_danger`
