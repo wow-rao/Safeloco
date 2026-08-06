@@ -328,6 +328,7 @@ _ACC_FIELDS = [
     "q_gap_sum", "q_gap_n", "peak_yaw", "peak_jerk", "handoffs",
     "steps_flight", "steps_partial", "steps_stance",
     "dnorm_flight", "dnorm_partial", "dnorm_stance",
+    "infeasible_steps",
 ]
 
 
@@ -367,11 +368,14 @@ class EvalCollector(object):
     """Steps the env under a filter and harvests per-episode records."""
 
     def __init__(self, env, runner, policy, filt, qsafe=None,
-                 trigger_source="vhat", run_meta=None):
+                 trigger_source="vhat", run_meta=None, cmd_filt=None):
         self.env = env
         self.runner = runner
         self.policy = policy
         self.filt = filt
+        # E4: optional command-space filter, applied before the policy runs.
+        # None for every other experiment, which leaves this path inert.
+        self.cmd_filt = cmd_filt
         self.qsafe = qsafe
         self.trigger_source = trigger_source
         self.meta = run_meta or {}
@@ -469,6 +473,25 @@ class EvalCollector(object):
             self.acc.add("lat_vel_sum", env.base_lin_vel[:, 1].abs(), live)
             self.acc.add_max("peak_yaw", env.base_ang_vel[:, 2].abs(), live)
             flight, partial, stance = self._contact_bucket()
+
+            # ---- command-space filter (E4) -------------------------------
+            # Runs *before* the policy, because the command is part of the
+            # observation the policy tracks.  Writing env.commands and
+            # refreshing the observation is what a navigation-layer filter
+            # does in deployment; the refresh is deterministic here because
+            # apply_eval_overrides turns observation noise off, so re-running
+            # compute_observations cannot resample anything.
+            if self.cmd_filt is not None:
+                cmd_new, cinfo = self.cmd_filt.apply(env.commands, env)
+                env.commands[:, :3] = cmd_new[:, :3]
+                env.compute_observations()
+                obs = env.obs_buf
+                privileged_obs = env.privileged_obs_buf
+                critic_obs = privileged_obs if privileged_obs is not None else obs
+                self.acc.add("activation_steps", cinfo["activated"], live)
+                self.acc.add("sum_dnorm_inf", cinfo["dnorm"], live)
+                self.acc.add_max("max_dnorm_inf", cinfo["dnorm"], live)
+                self.acc.add("infeasible_steps", cinfo["infeasible"], live)
 
             # ---- policy, then filter -------------------------------------
             with torch.no_grad():
@@ -587,6 +610,7 @@ class EvalCollector(object):
                 "mean_h": a["h_sum"][j] / n,
                 "min_h": a["h_min"][j],
                 "activation_steps": int(a["activation_steps"][j]),
+                "infeasible_steps": int(a["infeasible_steps"][j]),
                 "target_miss_steps": int(a["target_miss_steps"][j]),
                 "trigger_steps": int(a["trigger_steps"][j]),
                 "sum_dnorm_inf": a["sum_dnorm_inf"][j],

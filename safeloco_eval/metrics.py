@@ -90,6 +90,8 @@ EPISODE_FIELDS = [
     "term_proj_grav_z", "term_base_z_rel", "term_base_vel_z",
     # --- secondary proximity diagnostic ---------------------------------
     "n_proximity_steps",
+    # --- E4 command-filter diagnostic (infeasible box, §1) ---------------
+    "infeasible_steps",
     # --- E1 filter diagnostics ------------------------------------------
     "trigger_steps", "sum_dnorm_inf", "max_dnorm_inf", "sum_dnorm_l2",
     "mean_q_gap", "n_q_gap",
@@ -181,6 +183,17 @@ def viol_per_ep(recs):
 
 def eps_with_viol(recs):
     return sum(1 for r in recs if int(r["n_viol_steps"]) > 0), len(recs)
+
+
+def infeasibility_rate(recs):
+    """§1: clamp-active timesteps where the constraint set was empty.
+
+    Denominator is activation, not total steps -- an infeasible box only has
+    meaning on a step where the filter was trying to act.
+    """
+    k = sum(int(r.get("infeasible_steps", 0) or 0) for r in recs)
+    n = sum(int(r.get("activation_steps", 0) or 0) for r in recs)
+    return k, n
 
 
 def activation_rate(recs):

@@ -23,8 +23,21 @@ except ImportError:                                            # pragma: no cove
     print("SKIP tests/test_cone_constraint.py -- torch not available")
     sys.exit(0)
 
-from rsl_rl.algorithms.cone_constraint import (                # noqa: E402
-    damped_null_space_project, DEFAULT_D_SAFE, DEFAULT_D_DANGER)
+# Load the module by path rather than through `rsl_rl.algorithms`, whose
+# package __init__ drags in the policy classes and their dependencies.  This
+# file tests one function's arithmetic; it should not need the training stack
+# importable to run.
+import importlib.util                                          # noqa: E402
+
+_spec = importlib.util.spec_from_file_location(
+    "cone_constraint",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                 "rsl_rl", "algorithms", "cone_constraint.py"))
+_cc = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_cc)
+
+damped_null_space_project = _cc.damped_null_space_project
+DEFAULT_D_SAFE, DEFAULT_D_DANGER = _cc.DEFAULT_D_SAFE, _cc.DEFAULT_D_DANGER
 
 FAILED = []
 
