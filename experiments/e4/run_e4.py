@@ -81,20 +81,35 @@ def main():
     run_id = ARGS.run_id or default_run_id()
     os.makedirs(ARGS.out_dir, exist_ok=True)
 
+    # Snapshot the *training* command ranges before build_env_and_policy runs
+    # apply_eval_overrides, which collapses them to the fixed eval command
+    # (lin_vel_x -> [0.6, 0.6]).  Clamping to those collapsed ranges would pin
+    # the filtered command back to nominal every step -- the filter could not
+    # even brake, and E4 would be a straw man rather than a steel-man.
+    from legged_gym.utils import task_registry  # noqa: E402
+    _train_cfg_probe, _ = task_registry.get_cfgs(name=args.task)
+    _rng = _train_cfg_probe.commands.ranges
+    train_vx = tuple(getattr(_rng, "lin_vel_x", [0.0, 0.8]))
+    train_vy = tuple(getattr(_rng, "lin_vel_y", [0.0, 0.0]))
+
     env, runner, policy, env_cfg, train_cfg, resume_path = \
         EC.build_env_and_policy(args, ARGS.eval_terrain, ARGS.eval_envs,
                                 dr_mode=ARGS.dr)
 
-    rng = env_cfg.commands.ranges
-    vx_range = tuple(getattr(rng, "lin_vel_x", [-1.0, 1.0])) \
-        if ARGS.clamp_commands else None
-    vy_range = tuple(getattr(rng, "lin_vel_y", [-1.0, 1.0])) \
-        if ARGS.clamp_commands else None
-    # The eval config pins lin_vel_y to [0, 0], which would forbid the
-    # sidestepping that is the whole reason command space can work.  Widen the
-    # lateral clamp to the training range instead of the eval one.
+    vx_range = train_vx if ARGS.clamp_commands else None
+    vy_range = train_vy if ARGS.clamp_commands else None
+
+    # This policy's trained lateral range is [0, 0]: it was never taught to
+    # sidestep, so a lateral command is off-distribution and would not be
+    # tracked.  The CBF's premise is that commanded velocity IS the realised
+    # velocity to first order; commanding motion the policy cannot produce
+    # breaks that premise and would make the filter look safe on paper while
+    # the robot ignored it.  So the filter's authority here is essentially
+    # braking, and that is reported rather than engineered around.
     if ARGS.clamp_commands and vy_range is not None and vy_range[0] == vy_range[1]:
-        vy_range = (-0.6, 0.6)
+        print("[E4] NOTE: trained lateral command range is [{:g}, {:g}] -- the "
+              "filter can only modulate forward speed, not sidestep."
+              .format(*vy_range))
 
     cmd_filt = build_command_filter(
         ARGS.filter, alpha=ARGS.alpha, vx_range=vx_range, vy_range=vy_range,
@@ -127,6 +142,8 @@ def main():
         checkpoint=resume_path, checkpoint_sha=EC.sha256_file(resume_path),
         max_passes=ARGS.max_passes,
         clamp_commands=ARGS.clamp_commands,
+        train_vx_range=list(train_vx), train_vy_range=list(train_vy),
+        lateral_authority=(train_vy[1] > train_vy[0]),
         vx_range=list(vx_range) if vx_range else None,
         vy_range=list(vy_range) if vy_range else None,
         barrier="h = dist - 2*r_obs - 0.35 (legged_robot.py), relative degree 1 "

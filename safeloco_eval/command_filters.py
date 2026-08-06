@@ -56,7 +56,8 @@ class CommandStepInfo(dict):
     def empty(n, device):
         def z(dtype):
             return torch.zeros(n, device=device, dtype=dtype)
-        return CommandStepInfo(activated=z(torch.bool),
+        return CommandStepInfo(triggered=z(torch.bool),
+                               activated=z(torch.bool),
                                infeasible=z(torch.bool),
                                dnorm=z(torch.float),
                                min_h=z(torch.float))
@@ -146,6 +147,15 @@ class CBFCommandFilter(CommandFilter):
             a_sq = (a * a).sum(-1).clamp_min(1e-8)               # [B, N]
 
             live = env.has_obstacles.unsqueeze(-1) & mask
+
+            # "Triggered" = the nominal command already violates a constraint,
+            # i.e. the filter has work to do.  This is the denominator for
+            # infeasibility: a step where the filter never needed to act says
+            # nothing about whether the constraint set was satisfiable.
+            v0 = (a * u0.unsqueeze(1)).sum(-1) - b
+            v0 = torch.where(live, v0, torch.full_like(v0, -1.0))
+            info["triggered"] = v0.max(dim=-1).values > 1e-6
+
             for _ in range(self.max_passes):
                 viol = (a * u.unsqueeze(1)).sum(-1) - b           # [B, N]
                 viol = torch.where(live, viol, torch.zeros_like(viol))
@@ -161,14 +171,18 @@ class CBFCommandFilter(CommandFilter):
                 step = (worst.values / a_sq[rows, idx]).clamp_min(0.0)
                 u = u - step.unsqueeze(-1) * a_w
 
-            resid = (a * u.unsqueeze(1)).sum(-1) - b
-            resid = torch.where(live, resid, torch.full_like(resid, -1.0))
-            info["infeasible"] = resid.max(dim=-1).values > 1e-4
-
+            # Clamp *before* measuring the residual: the clamp is part of the
+            # filter, so feasibility has to be judged on the command that is
+            # actually executed.  Measuring it pre-clamp let infeasible_steps
+            # exceed activation_steps, which is not a rate.
             if self.vx_range is not None:
                 u[:, 0] = u[:, 0].clamp(self.vx_range[0], self.vx_range[1])
             if self.vy_range is not None:
                 u[:, 1] = u[:, 1].clamp(self.vy_range[0], self.vy_range[1])
+
+            resid = (a * u.unsqueeze(1)).sum(-1) - b
+            resid = torch.where(live, resid, torch.full_like(resid, -1.0))
+            info["infeasible"] = (resid.max(dim=-1).values > 1e-4) & info["triggered"]
 
             d_norm = (u - u0).abs().amax(dim=-1)
             info["dnorm"] = d_norm

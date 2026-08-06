@@ -58,14 +58,34 @@ exhausted; a residual violation is recorded as `infeasible_steps` (§1's
 Infeasibility %, with activation as the denominator). A QP solver would give
 the same answer for two variables and is not worth the dependency.
 
-### Command clamping
+### Command clamping, and what authority the filter actually has
 
-The filtered command is clamped to the range the policy was trained on. An
-off-distribution command would be tracked badly and would flatter the filter —
-it would look safe while the robot simply failed to follow it. The eval config
-pins lateral velocity to `[0, 0]`, which would forbid the sidestepping that is
-the whole reason command space can work, so the lateral clamp is widened to the
-training range. `--no_clamp_commands` disables clamping entirely.
+The filtered command is clamped to the range the policy **was trained on**,
+read before `apply_eval_overrides` collapses those ranges to the fixed eval
+command. Clamping to the collapsed range would pin `v_x` back to 0.6 every
+step and the filter could not even brake.
+
+This matters more than it sounds, because π_nom's trained ranges are:
+
+```
+lin_vel_x   = [0.0, 0.8]
+lin_vel_y   = [-0.0, 0.0]      <-- never trained to sidestep
+ang_vel_yaw = [-0.01, 0.01]    <-- effectively straight-ahead only
+```
+
+**So the filter's only real authority is braking.** It can slow the robot from
+0.8 m/s to a stop; it cannot steer around anything. Widening the lateral clamp
+would let it *command* a sidestep, but the policy was never trained to track
+one, so the commanded velocity would not be the realised velocity — and that
+premise is exactly what gives the barrier relative degree one. A filter whose
+commands the robot ignores is unsound, not conservative, and would look safe on
+paper while nothing changed on the ground.
+
+This is reported rather than engineered around. It does narrow what E4 can
+show: it is a fair test of *command-space CBF on this policy*, and a weaker
+test of command-space CBF in general than it would be against a policy trained
+with lateral and yaw authority. `--no_clamp_commands` removes the clamp for a
+contrast run, and `lateral_authority` is recorded in every manifest.
 
 ---
 
@@ -120,7 +140,9 @@ python tests/test_e4_offline.py
 - **Infeasibility should be rare.** A high rate means the robot is routinely
   boxed in between obstacles with no admissible command, which is a statement
   about the corridor geometry rather than about the filter.
-- **Watch lateral velocity.** If command-space filtering works, it should work
-  by sidestepping, and `|lat vel|` should climb toward our method's 0.085.
-  Safety improving *without* lateral velocity moving would be worth
-  investigating before believing it.
+- **Expect braking, not sidestepping.** With `lin_vel_y` trained to `[0, 0]`,
+  safety here can only come from slowing down, so `|lat vel|` should stay near
+  π_nom's ≈0.049 and velocity error should rise as α tightens. Lateral velocity
+  climbing toward our method's 0.085 would mean the robot is being pushed
+  sideways by something other than the command, and is worth investigating
+  before believing any safety improvement that accompanies it.

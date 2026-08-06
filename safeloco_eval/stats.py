@@ -23,6 +23,11 @@ def wilson_ci(k, n, z=Z95):
     """
     if n <= 0:
         return (float("nan"), 0.0, 1.0)
+    if k > n:
+        raise ValueError(
+            "wilson_ci: successes exceed trials (k={}, n={}). This is an "
+            "accounting bug in whatever produced the counts, not a rate."
+            .format(k, n))
     p = k / n
     denom = 1.0 + z * z / n
     centre = (p + z * z / (2 * n)) / denom

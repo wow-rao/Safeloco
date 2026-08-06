@@ -488,6 +488,7 @@ class EvalCollector(object):
                 obs = env.obs_buf
                 privileged_obs = env.privileged_obs_buf
                 critic_obs = privileged_obs if privileged_obs is not None else obs
+                self.acc.add("trigger_steps", cinfo["triggered"], live)
                 self.acc.add("activation_steps", cinfo["activated"], live)
                 self.acc.add("sum_dnorm_inf", cinfo["dnorm"], live)
                 self.acc.add_max("max_dnorm_inf", cinfo["dnorm"], live)

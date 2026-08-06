@@ -62,7 +62,7 @@ def make_records(n, coll_frac, fall_p, ret, vel_err, lat_vel, alpha,
                  seed=1, episode_idx=i, terrain="corridor", n_steps=steps,
                  n_collision_steps=int(round(coll_frac * steps)),
                  fell=0, term_timeout=1,
-                 activation_steps=act,
+                 activation_steps=act, trigger_steps=act,
                  infeasible_steps=int(round(infeasible_frac * act)))
         r["collided"] = 1 if r["n_collision_steps"] > 0 else 0
         r["return"] = ret
@@ -162,15 +162,36 @@ def test_infeasibility_denominator():
     recs = make_records(10, 0.1, 0.0, 30.0, 0.15, 0.05, 1.0,
                         activation_frac=0.5, infeasible_frac=0.2)
     k, n = M.infeasibility_rate(recs)
-    check("infeasibility denominator is activation steps",
-          n == sum(int(r["activation_steps"]) for r in recs),
+    check("infeasibility denominator is trigger steps",
+          n == sum(int(r["trigger_steps"]) for r in recs),
           "got n=%r" % n)
-    check("infeasibility rate is the fraction of active steps",
+    check("infeasibility rate is the fraction of triggered steps",
           abs(k / n - 0.2) < 1e-6, "got %.4f" % (k / n))
     idle = make_records(5, 0.1, 0.0, 30.0, 0.15, 0.05, None,
                         activation_frac=0.0)
     ik, inn = M.infeasibility_rate(idle)
     check("no activation -> zero denominator, no crash", (ik, inn) == (0, 0))
+
+
+def test_infeasible_cannot_exceed_trigger():
+    """Regression: infeasible_steps > trigger_steps is not a rate.
+
+    The command filter used to measure feasibility *before* clamping, so a
+    step could be counted infeasible while the clamp returned the command to
+    nominal and left it unactivated.  wilson_ci then took sqrt of a negative
+    and died with a bare math domain error.
+    """
+    import safeloco_eval.stats as _ST
+    try:
+        _ST.wilson_ci(7, 3)
+    except ValueError as exc:
+        check("wilson_ci names the accounting bug rather than failing in sqrt",
+              "exceed" in str(exc), str(exc))
+    else:
+        check("wilson_ci names the accounting bug rather than failing in sqrt",
+              False, "-> accepted k > n")
+    check("wilson_ci still handles an empty denominator",
+          _ST.wilson_ci(0, 0)[1:] == (0.0, 1.0))
 
 
 def test_sanity_checks(tmp):
@@ -317,6 +338,7 @@ def main():
         test_lat_vel_is_not_scored(tmp)
         print("\n[§1 metrics]")
         test_infeasibility_denominator()
+        test_infeasible_cannot_exceed_trigger()
         print("\n[§5 sanity checks]")
         test_sanity_checks(tmp)
         print("\n[end to end]")

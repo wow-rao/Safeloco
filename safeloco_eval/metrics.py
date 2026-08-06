@@ -186,13 +186,16 @@ def eps_with_viol(recs):
 
 
 def infeasibility_rate(recs):
-    """§1: clamp-active timesteps where the constraint set was empty.
+    """§1: filter-active timesteps where the constraint set was empty.
 
-    Denominator is activation, not total steps -- an infeasible box only has
-    meaning on a step where the filter was trying to act.
+    Denominator is **trigger** steps -- those where the nominal command already
+    violated a constraint, so the filter had work to do.  Activation is the
+    wrong denominator: a step can be infeasible precisely *because* the filter
+    could not move the command, which would leave it triggered but not
+    activated and let the numerator exceed the denominator.
     """
     k = sum(int(r.get("infeasible_steps", 0) or 0) for r in recs)
-    n = sum(int(r.get("activation_steps", 0) or 0) for r in recs)
+    n = sum(int(r.get("trigger_steps", 0) or 0) for r in recs)
     return k, n
 
 
