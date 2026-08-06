@@ -7,6 +7,7 @@
 #   train      3 variants x SEEDS full training runs
 #   eval       every checkpoint evaluated twice, with and without the filter
 #   analyze    Table R2a, the §3.2 verdict, the §7 sentence
+#   package    tar everything an analysis needs, reporting anything missing
 #
 # Configure by environment variable, e.g.
 #   EPS=0.2 SEEDS="1 2 3" ./experiments/e2/sweep_e2.sh all
@@ -111,4 +112,98 @@ if [ "$stage" = "analyze" ] || [ "$stage" = "all" ]; then
     --dir "${EVAL_DIR}" \
     --train_dir "logs/${EXPERIMENT}" \
     --out "${OUT}/R2a"
+fi
+
+# ---- package -------------------------------------------------------------
+# Collect every artefact an analysis needs into one tarball, and say plainly
+# what is missing rather than producing a quietly incomplete archive.
+if [ "$stage" = "package" ] || [ "$stage" = "all" ]; then
+  echo "=== E2 package ==="
+  STAMP="$(date +%Y%m%d_%H%M%S)"
+  PKG="${OUT}/pkg_${STAMP}"
+  MISSING="${PKG}/MISSING.txt"
+  mkdir -p "${PKG}/eval" "${PKG}/train" "${PKG}/calibration"
+  : > "${MISSING}"
+
+  take () {  # take <src> <dest-dir> ; records a miss instead of failing
+    if [ -f "$1" ]; then cp "$1" "$2/" ; else echo "$1" >> "${MISSING}" ; fi
+  }
+
+  # results tables
+  for f in "${OUT}/R2a.json" "${OUT}/R2a.md"; do take "${f}" "${PKG}"; done
+  # the critic these runs filtered against, for cross-referencing E1
+  take "${QSAFE_REPORT}" "${PKG}"
+
+  # per-episode eval records: variants x seeds x {with,without} test filter
+  n_eval=0
+  for v in ${VARIANTS}; do
+    for s in ${SEEDS}; do
+      for tf in on off; do
+        base="e2_${v}_s${s}_tf${tf}"
+        take "${EVAL_DIR}/${base}.csv" "${PKG}/eval"
+        take "${EVAL_DIR}/${base}.manifest.json" "${PKG}/eval"
+        if [ -f "${EVAL_DIR}/${base}.csv" ]; then n_eval=$((n_eval + 1)); fi
+      done
+    done
+  done
+
+  # per-iteration training diagnostics + the config each run actually used
+  n_train=0
+  for v in ${VARIANTS}; do
+    for s in ${SEEDS}; do
+      run="e2_${v}_s${s}"
+      d="logs/${EXPERIMENT}/${run}"
+      mkdir -p "${PKG}/train/${run}"
+      take "${d}/train_diag.csv" "${PKG}/train/${run}"
+      take "${d}/e2_config.json" "${PKG}/train/${run}"
+      if [ -f "${d}/train_diag.csv" ]; then n_train=$((n_train + 1)); fi
+    done
+  done
+
+  # calibration runs, so the epsilon choice is auditable from the archive
+  for d in logs/"${EXPERIMENT}"/e2_*_cal_eps*; do
+    [ -d "${d}" ] || continue
+    b="$(basename "${d}")"
+    mkdir -p "${PKG}/calibration/${b}"
+    for f in calibration.json train_diag.csv; do
+      if [ -f "${d}/${f}" ]; then cp "${d}/${f}" "${PKG}/calibration/${b}/"; fi
+    done
+  done
+
+  # provenance: what code produced this
+  {
+    echo "packaged   $(date -Is)"
+    echo "git_commit $(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "git_dirty  $(test -n "$(git status --porcelain 2>/dev/null)" && echo yes || echo no)"
+    echo "eps        ${EPS}"
+    echo "tau        ${TAU}"
+    echo "filter     ${FILTER}"
+    echo "variants   ${VARIANTS}"
+    echo "seeds      ${SEEDS}"
+    echo "iterations ${TRAIN_ITERS}"
+    echo "episodes   ${N_EPISODES}"
+  } > "${PKG}/RUN_INFO.txt"
+
+  n_v=0; for v in ${VARIANTS}; do n_v=$((n_v + 1)); done
+  n_s=0; for s in ${SEEDS}; do n_s=$((n_s + 1)); done
+  exp_train=$((n_v * n_s))
+  exp_eval=$((exp_train * 2))
+
+  TAR="${OUT}/e2_results_${STAMP}.tar.gz"
+  tar -czf "${TAR}" -C "$(dirname "${PKG}")" "$(basename "${PKG}")"
+
+  echo
+  echo "  eval CSVs      ${n_eval}/${exp_eval}"
+  echo "  train_diag     ${n_train}/${exp_train}"
+  if [ -s "${MISSING}" ]; then
+    echo
+    echo "  MISSING $(wc -l < "${MISSING}") file(s) -- listed in MISSING.txt:"
+    sed 's/^/    /' "${MISSING}"
+    echo
+    echo "  Archive still written; send it and say which stage did not finish."
+  else
+    echo "  nothing missing"
+  fi
+  echo
+  echo "  -> ${TAR}  ($(du -h "${TAR}" | cut -f1))"
 fi
