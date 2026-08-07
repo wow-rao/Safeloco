@@ -429,7 +429,8 @@ _ACC_FIELDS = [
     "n_viol_steps", "return", "vel_err_sum",
     "lat_vel_sum", "fwd_vel_sum", "h_sum", "h_min", "activation_steps", "target_miss_steps",
     "sum_dnorm_v", "sum_dnorm_omega",
-    "sum_yaw_cmd_abs", "sum_yaw_realised_abs", "yaw_cmd_steps",
+    "sum_yaw_cmd_abs", "sum_yaw_realised_abs", "sum_yaw_signed",
+    "yaw_cmd_steps",
     "trigger_steps", "sum_dnorm_inf", "max_dnorm_inf", "sum_dnorm_l2",
     "q_gap_sum", "q_gap_n", "peak_yaw", "peak_jerk", "handoffs",
     "steps_flight", "steps_partial", "steps_stance",
@@ -633,12 +634,22 @@ class EvalCollector(object):
                     # Accumulated only over steps where yaw was commanded, so
                     # the ratio is a tracking gain and not diluted by the
                     # steps where the filter asked for nothing.
-                    yaw_cmd = cmd_new[:, 2].abs()
-                    asked = yaw_cmd > 1e-3
+                    yaw_cmd = cmd_new[:, 2]
+                    asked = yaw_cmd.abs() > 1e-3
                     self.acc.add("yaw_cmd_steps", asked, live)
-                    self.acc.add("sum_yaw_cmd_abs", yaw_cmd * asked, live)
+                    self.acc.add("sum_yaw_cmd_abs", yaw_cmd.abs() * asked, live)
                     self.acc.add("sum_yaw_realised_abs",
                                  env.base_ang_vel[:, 2].abs() * asked, live)
+                    # The one that answers the question.  |realised| cannot
+                    # tell turning from gait wobble, and the wobble is an
+                    # order of magnitude larger: peak yaw rate is 1.4-2.0
+                    # rad/s in every row including unfiltered, against a
+                    # commanded 0.1-0.8.  Projecting the realised yaw onto
+                    # the commanded direction averages to ~0 under symmetric
+                    # wobble and to |cmd| under real tracking.
+                    self.acc.add("sum_yaw_signed",
+                                 torch.sign(yaw_cmd) * env.base_ang_vel[:, 2]
+                                 * asked, live)
 
             # ---- policy, then filter -------------------------------------
             with torch.no_grad():
@@ -763,6 +774,7 @@ class EvalCollector(object):
                 "sum_dnorm_omega": a["sum_dnorm_omega"][j],
                 "sum_yaw_cmd_abs": a["sum_yaw_cmd_abs"][j],
                 "sum_yaw_realised_abs": a["sum_yaw_realised_abs"][j],
+                "sum_yaw_signed": a["sum_yaw_signed"][j],
                 "yaw_cmd_steps": a["yaw_cmd_steps"][j],
                 "target_miss_steps": int(a["target_miss_steps"][j]),
                 "trigger_steps": int(a["trigger_steps"][j]),

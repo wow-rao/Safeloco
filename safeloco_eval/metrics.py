@@ -101,7 +101,8 @@ EPISODE_FIELDS = [
     # policy cannot track the yaw it was given, the executed motion does not
     # satisfy the constraint the filter certified, and the filter has braked
     # less on the strength of steering that never happened.
-    "sum_yaw_cmd_abs", "sum_yaw_realised_abs", "yaw_cmd_steps",
+    "sum_yaw_cmd_abs", "sum_yaw_realised_abs", "sum_yaw_signed",
+    "yaw_cmd_steps",
     # --- E1 filter diagnostics ------------------------------------------
     "trigger_steps", "sum_dnorm_inf", "max_dnorm_inf", "sum_dnorm_l2",
     "mean_q_gap", "n_q_gap",
@@ -384,7 +385,18 @@ def mean_fwd_vel(recs):
 
 
 def yaw_execution_gain(recs):
-    """Realised yaw rate / commanded yaw rate, over steps where yaw was asked.
+    """Yaw realised *in the commanded direction*, over commanded yaw.
+
+    Uses the signed projection sign(w_cmd) * w_realised, not |w_realised|.
+    That distinction decides the metric: a walking quadruped's yaw rate
+    swings to 1.4-2.0 rad/s from gait alone -- an order of magnitude above
+    the 0.1-0.8 rad/s a filter commands -- so |w_realised| is dominated by
+    wobble and reads as near-perfect tracking even when the robot is not
+    turning at all. The signed projection averages to ~0 under symmetric
+    wobble and to |w_cmd| under real tracking.
+
+    Falls back to the absolute ratio for records written before the signed
+    column existed, and says so via `yaw_execution_gain_is_signed`.
 
     A CBF certifies a twist on the assumption the twist is executed.  If the
     policy cannot track the yaw the filter hands it, the executed motion does
@@ -397,7 +409,18 @@ def yaw_execution_gain(recs):
     answer for the yaw-disabled arm rather than a misleading zero.
     """
     cmd = sum(float(r.get("sum_yaw_cmd_abs", 0) or 0) for r in recs)
-    real = sum(float(r.get("sum_yaw_realised_abs", 0) or 0) for r in recs)
     if cmd <= 1e-9:
         return float("nan")
-    return real / cmd
+    if yaw_execution_gain_is_signed(recs):
+        return sum(float(r.get("sum_yaw_signed", 0) or 0) for r in recs) / cmd
+    return sum(float(r.get("sum_yaw_realised_abs", 0) or 0)
+               for r in recs) / cmd
+
+
+def yaw_execution_gain_is_signed(recs):
+    """True when the records carry the signed column, i.e. the gain is real.
+
+    Without it the value is an absolute ratio inflated by gait wobble and
+    must not be read as a tracking gain.
+    """
+    return any("sum_yaw_signed" in r for r in recs)

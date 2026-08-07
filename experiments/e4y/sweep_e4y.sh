@@ -155,7 +155,22 @@ if [ "$stage" = "package" ] || [ "$stage" = "all" ]; then
     echo "lookahead  ${LOOKAHEAD}"
     echo "weights    w_v=${W_V} w_omega=${W_OMEGA}"
     echo "barrier    ${BARRIER}"
-    echo "omega_lim  ${OMEGA_LIMIT:-trained range}"
+    # Read from the manifests, not from the environment: package is often run
+    # in a later shell than sweep, and reporting this shell's OMEGA_LIMIT said
+    # "trained range" for a sweep that had actually used +-1.0 rad/s.
+    echo "omega_lim  $(python - "${SWEEP_DIR}" <<'PYEOF'
+import glob, json, os, sys
+vals = set()
+for f in glob.glob(os.path.join(sys.argv[1], "*.manifest.json")):
+    try:
+        m = json.load(open(f))
+    except Exception:
+        continue
+    if m.get("yaw_enabled"):
+        vals.add(tuple(m.get("omega_range") or []))
+print("; ".join(str(list(v)) for v in sorted(vals)) if vals else "n/a")
+PYEOF
+)"
     echo "replica_a  ${REPLICA_ALPHAS:-none}"
     echo "episodes   ${N_EPISODES}"
   } > "${PKG}/RUN_INFO.txt"
