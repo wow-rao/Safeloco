@@ -156,12 +156,15 @@ def heading_control_coverage(env):
     The slice bound is `ceil(num_envs * sum(terrain_proportions[:9]))`, so it
     depends on the terrain:
 
+        flat      proportions[9]  = 1  ->  bound 0, nobody is covered
         corridor  proportions[10] = 1  ->  bound 0, nobody is covered
-        flat      proportions[0]  = 1  ->  bound N, everybody is covered
+        wave      proportions[0]  = 1  ->  bound N, everybody is covered
 
-    which is why a command-response calibration on flat ground measures a yaw
-    tracking gain of zero no matter what the policy can do, while the corridor
-    sweep it is meant to inform is unaffected.  Returns (n_covered, n_envs).
+    Calibration and sweep therefore see the same command interface, which is
+    the point.  The calibration originally ran on `wave` by mistake -- it was
+    the entry named 'flat' -- where the heading controller overwrote the yaw
+    command outright and the measured tracking gain was zero regardless of
+    what the policy could do.  Returns (n_covered, n_envs).
     """
     if not bool(getattr(env.cfg.commands, "heading_command", False)):
         return 0, int(env.num_envs)
@@ -267,10 +270,14 @@ class PolicyRuntime(object):
         self.grid_enabled = occ_cfg is not None and occ_cfg.enabled
         self.grid_shape = ((occ_cfg.grid_H, occ_cfg.grid_W)
                            if self.grid_enabled else None)
+        self._history_reads = 0
+        self._warned_post_step = False
 
     def reset(self, obs):
         env = self.env
         n = env.num_envs
+        self._history_reads = 0
+        self._warned_post_step = False
         self.trajectory_history = torch.zeros(
             (n, self.history_length,
              env.num_obs - env.privileged_dim - env.height_dim - 3),
@@ -321,10 +328,26 @@ class PolicyRuntime(object):
             self.wm_is_first[:] = 0
 
     def history(self):
+        # A loop that drives the policy but never calls post_step gets a
+        # frozen history, a world model re-encoding the same proprioception,
+        # and an all-zero depth image and occupancy grid.  The policy then
+        # produces actions that do not walk, which reads as a broken
+        # checkpoint or an untrackable command rather than as a broken loop.
+        # It cost a calibration run to find, so say so instead.
+        self._history_reads += 1
+        if self._history_reads > 10 and not self._warned_post_step:
+            self._warned_post_step = True
+            print("[PolicyRuntime] WARNING: history() has been read {} times "
+                  "with no intervening post_step(). The trajectory history "
+                  "and world-model inputs are frozen at reset, so the policy "
+                  "is acting on a stale snapshot. Call post_step(obs, infos, "
+                  "dones, reset_ids) after every env.step().".format(
+                      self._history_reads))
         return self.trajectory_history.flatten(1).to(self.env.device)
 
     def post_step(self, obs, infos, dones, reset_env_ids):
         env = self.env
+        self._history_reads = 0
         if self.grid_enabled:
             new_grid = infos.get("occupancy_grid", None)
             if new_grid is not None:

@@ -68,7 +68,8 @@ import torch  # noqa: E402
 from safeloco_eval import eval_common as EC  # noqa: E402
 
 
-def measure(env, policy, rt, axis, value, vx, hold_steps, settle_steps):
+def measure(env, policy, rt, axis, value, vx, hold_steps, settle_steps,
+            clip_actions):
     """Hold one setpoint and report what the base actually did."""
     env.commands[:, 0] = vx
     env.commands[:, 1] = value if axis == "vy" else 0.0
@@ -93,7 +94,19 @@ def measure(env, policy, rt, axis, value, vx, hold_steps, settle_steps):
         with torch.no_grad():
             a = policy(obs.detach(), rt.history().detach(),
                        rt.wm_feature.detach(), grid=rt.occ_grid)
-        obs, _, _, _, _, _, _ = env.step(a.detach())
+            # Same clamp the sweep applies, so the calibration measures the
+            # policy the sweep runs rather than a slightly different one.
+            a = a.clamp(-clip_actions, clip_actions)
+        obs, _, _, dones, infos, reset_ids, _ = env.step(a.detach())
+        # Without this the policy is driven from a frozen snapshot: the
+        # trajectory history stays at whatever `reset` put in it, the world
+        # model keeps re-encoding the same proprioception, and the depth
+        # image and occupancy grid stay at zeros.  The robot then does not
+        # walk -- forward tracking gain 0.03 -- and every command-response
+        # number measured on top of that is meaningless.  EvalCollector calls
+        # this every step; this loop has to as well or it is not measuring
+        # the same policy the sweep runs.
+        rt.post_step(obs, infos, dones, reset_ids)
         if t >= settle_steps:
             # Did the command we wrote survive the step, or did something in
             # the env overwrite it? A gain of zero means nothing about the
@@ -128,14 +141,12 @@ def main():
     env, runner, policy, env_cfg, _, resume_path = EC.build_env_and_policy(
         args, "flat", ARGS.eval_envs, dr_mode="off")
 
-    # The yaw-rate command has to actually reach the policy, and by default it
-    # does not.  With `heading_command = True` the env recomputes
-    # `commands[:, 2]` every step from the heading error, discarding whatever
-    # was written there.  How many envs that covers depends on the terrain --
-    # `[:roughflat_start_idx]`, which is all of them on flat ground and none
-    # of them in the corridor.  So an open-loop sweep on flat ground measures
-    # a yaw tracking gain of zero regardless of what the policy can do, while
-    # the corridor sweep this calibration is meant to inform is unaffected.
+    # Belt and braces on the yaw axis.  With `heading_command = True` the env
+    # recomputes `commands[:, 2]` every step from the heading error and
+    # discards whatever was written there -- but only for envs
+    # `[:roughflat_start_idx]`, which on this terrain and in the corridor is
+    # nobody.  Disabling it anyway keeps the measurement independent of that
+    # index arithmetic, and reports if it was ever going to bite.
     covered, total = EC.heading_control_coverage(env)
     heading_was_on = EC.disable_heading_command(env)
     if heading_was_on:
@@ -145,6 +156,7 @@ def main():
               "way -- there its coverage is 0.".format(covered, total))
 
     rt = EC.PolicyRuntime(env, runner)
+    clip_actions = float(env_cfg.normalization.clip_actions)
 
     dt = float(env.dt)
     hold = int(ARGS.hold_s / dt)
@@ -159,7 +171,8 @@ def main():
     # next acts; ~100% means the axis is being overwritten wholesale.
     drift, drift_frac = 0.0, 0.0
     for w in ARGS.omega_setpoints:
-        m = measure(env, policy, rt, "omega", w, ARGS.vx, hold, settle)
+        m = measure(env, policy, rt, "omega", w, ARGS.vx, hold, settle,
+                    clip_actions)
         results["omega"].append({"cmd": w, "yaw": m["yaw"], "vx": m["vx"],
                                  "cmd_drift": m["cmd_drift"]})
         drift = max(drift, m["cmd_drift"])
@@ -168,7 +181,8 @@ def main():
         print("  omega cmd %+.2f -> realised %+.3f rad/s  (vx %.3f, cmd drift "
               "%.4f)" % (w, m["yaw"], m["vx"], m["cmd_drift"]))
     for vy in ARGS.vy_setpoints:
-        m = measure(env, policy, rt, "vy", vy, ARGS.vx, hold, settle)
+        m = measure(env, policy, rt, "vy", vy, ARGS.vx, hold, settle,
+                    clip_actions)
         results["vy"].append({"cmd": vy, "vy": m["vy"], "vx": m["vx"],
                               "cmd_drift": m["cmd_drift"]})
         drift = max(drift, m["cmd_drift"])
