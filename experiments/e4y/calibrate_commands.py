@@ -151,12 +151,20 @@ def main():
     settle = int(ARGS.settle_s / dt)
 
     results = {"omega": [], "vy": []}
-    drift = 0.0
+    # Absolute drift scales with the setpoint, so a fixed threshold flags a
+    # large command and misses a small one.  What matters is the *fraction*
+    # of the commanded magnitude that failed to survive: ~1% is the
+    # occasional resample or episode reset and is harmless, because the
+    # command is re-pinned and the observation recomputed before the policy
+    # next acts; ~100% means the axis is being overwritten wholesale.
+    drift, drift_frac = 0.0, 0.0
     for w in ARGS.omega_setpoints:
         m = measure(env, policy, rt, "omega", w, ARGS.vx, hold, settle)
         results["omega"].append({"cmd": w, "yaw": m["yaw"], "vx": m["vx"],
                                  "cmd_drift": m["cmd_drift"]})
         drift = max(drift, m["cmd_drift"])
+        if abs(w) > 1e-9:
+            drift_frac = max(drift_frac, m["cmd_drift"] / abs(w))
         print("  omega cmd %+.2f -> realised %+.3f rad/s  (vx %.3f, cmd drift "
               "%.4f)" % (w, m["yaw"], m["vx"], m["cmd_drift"]))
     for vy in ARGS.vy_setpoints:
@@ -164,6 +172,8 @@ def main():
         results["vy"].append({"cmd": vy, "vy": m["vy"], "vx": m["vx"],
                               "cmd_drift": m["cmd_drift"]})
         drift = max(drift, m["cmd_drift"])
+        if abs(vy) > 1e-9:
+            drift_frac = max(drift_frac, m["cmd_drift"] / abs(vy))
         print("  v_y   cmd %+.2f -> realised %+.3f m/s    (vx %.3f, cmd drift "
               "%.4f)" % (vy, m["vy"], m["vx"], m["cmd_drift"]))
 
@@ -191,9 +201,24 @@ def main():
         "checkpoint": resume_path,
         "git_commit": EC.git_commit(),
     }
+    # Before any tracking gain means anything, the robot has to be walking.
+    # Forward speed is the axis the policy was definitely trained on, at the
+    # dead centre of its trained range, so if it cannot track that, nothing
+    # measured here is about the command interface.  The first version of this
+    # script ran on wave terrain by mistake and reported vx = 0.05 m/s against
+    # a 0.6 m/s command; the yaw gain it produced was meaningless and there
+    # was no check to say so.
+    vx_realised = (sum(p["vx"] for p in results["omega"]) /
+                   max(len(results["omega"]), 1))
+    vx_gain = vx_realised / ARGS.vx if ARGS.vx > 1e-9 else float("nan")
+
     blob["heading_command_was_on"] = heading_was_on
     blob["heading_control_covered_envs"] = covered
     blob["max_cmd_drift"] = drift
+    blob["max_cmd_drift_fraction"] = drift_frac
+    blob["vx_realised_mean"] = vx_realised
+    blob["vx_tracking_gain"] = vx_gain
+    blob["locomotion_ok"] = bool(vx_gain > 0.5)
     # A gain near 1 up to a clear saturation point means the filter's commands
     # are real; a gain near 0 means it is issuing instructions into the void.
     #
@@ -202,13 +227,24 @@ def main():
     # bug in the measurement. `cmd_drift` is how far the command had moved by
     # the end of each step, so a large value means something overwrote it and
     # the gain says nothing about the policy at all.
-    if drift > 1e-3:
+    #
+    # Order matters: not-walking invalidates everything, a systematically
+    # overwritten command invalidates the axis, and only if both are clean
+    # does a low gain say something about the policy.
+    if not blob["locomotion_ok"]:
         blob["verdict"] = (
-            "MEASUREMENT INVALID -- the commanded setpoint did not survive the "
-            "step (mean drift {:.4f}). Something in the env is overwriting "
-            "the command, so this sweep says nothing about what the policy "
-            "can track. Do not read a low gain as a policy limitation."
-            .format(drift))
+            "MEASUREMENT INVALID -- the robot is not tracking forward speed "
+            "({:.3f} m/s realised against {:.2f} commanded, gain {:.2f}). It "
+            "is not walking, so no tracking gain here is about the command "
+            "interface. Check the terrain and the checkpoint before reading "
+            "anything else.".format(vx_realised, ARGS.vx, vx_gain))
+    elif drift_frac > 0.10:
+        blob["verdict"] = (
+            "MEASUREMENT INVALID -- the commanded setpoint did not survive "
+            "the step ({:.0f}% of the commanded magnitude). Something in the "
+            "env is overwriting the command, so this sweep says nothing about "
+            "what the policy can track. Do not read a low gain as a policy "
+            "limitation.".format(100 * drift_frac))
     else:
         blob["verdict"] = (
             "yaw tracking usable" if gain_w > 0.5 else
@@ -226,8 +262,13 @@ def main():
     print("min turn radius @%.1f m/s: %.2f m   vs corridor width %.1f m"
           % (ARGS.vx, turn_r, ARGS.corridor_width))
     print("steering possible here  : %s" % blob["steering_geometrically_possible"])
-    print("command drift (max)     : %.5f   %s" % (
-        drift, "OK -- the setpoint survived each step" if drift <= 1e-3
+    print("forward tracking gain   : %.3f  (%.3f m/s realised / %.2f commanded)  %s"
+          % (vx_gain, vx_realised, ARGS.vx,
+             "OK -- the robot is walking" if blob["locomotion_ok"]
+             else "*** NOT WALKING; nothing below is meaningful ***"))
+    print("command drift (max)     : %.5f  (%.1f%% of commanded)  %s" % (
+        drift, 100 * drift_frac,
+        "OK -- the setpoint survived each step" if drift_frac <= 0.10
         else "*** the setpoint was OVERWRITTEN; gain is meaningless ***"))
     print("VERDICT: %s" % blob["verdict"])
     print("wrote %s" % ARGS.out)

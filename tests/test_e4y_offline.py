@@ -298,20 +298,51 @@ def test_heading_control_coverage_is_terrain_dependent():
             self.cfg = FakeCfg(heading)
             self.roughflat_start_idx = _math.ceil(n * sum(props[:9]))
 
+    # The calibration terrain must be the flattest the generator makes, which
+    # is proportion index 9 (random_uniform_terrain only -- the corridor's
+    # base without obstacles).  Index 0 is wave_terrain(num_waves=5): the
+    # calibration ran there by mistake and the robot crawled at 0.05 m/s
+    # against a 0.6 m/s command, which invalidated every gain it reported.
+    props = EC.TERRAIN_PROPORTIONS["flat"]
+    check("'flat' selects proportion index 9, not 0",
+          len(props) == 10 and props[9] == 1.0 and props[0] == 0,
+          "got %r" % (props,))
+    # Adjacent branches in the generator: index 9 is random_uniform_terrain
+    # alone, index 10 is the same base plus the corridor obstacles.  Neither
+    # touches indices 0-8, which is what keeps them comparable.
+    corridor_props = EC.TERRAIN_PROPORTIONS["corridor"]
+    check("neither 'flat' nor 'corridor' uses the rough terrain types 0-8",
+          sum(props[:9]) == 0 and sum(corridor_props[:9]) == 0,
+          "flat=%r corridor=%r" % (props, corridor_props))
+    check("'corridor' is the next branch along, index 10",
+          len(corridor_props) == 11 and corridor_props[10] == 1.0)
+    check("the wave terrain is still reachable, under its own name",
+          EC.TERRAIN_PROPORTIONS["wave"][0] == 1.0)
+
+    # roughflat_start_idx = ceil(N * sum(proportions[:9])), and that is the
+    # slice the heading controller overwrites.  Both calibration and sweep
+    # terrains put zero mass in [:9], so neither is covered -- which is the
+    # point: the calibration now measures the same command interface the
+    # sweep uses.  Wave terrain is what the calibration was accidentally
+    # using, and it covers everything.
     flat = FakeEnv("flat")
     corridor = FakeEnv("corridor")
-    check("flat ground: heading control covers every env",
-          EC.heading_control_coverage(flat) == (250, 250),
+    check("flat: heading control covers no env, as in the corridor",
+          EC.heading_control_coverage(flat) == (0, 250),
           "got %r" % (EC.heading_control_coverage(flat),))
     check("corridor: heading control covers no env",
           EC.heading_control_coverage(corridor) == (0, 250),
           "got %r" % (EC.heading_control_coverage(corridor),))
+    check("wave terrain would have covered every env -- the original bug",
+          EC.heading_control_coverage(FakeEnv("wave")) == (250, 250),
+          "got %r" % (EC.heading_control_coverage(FakeEnv("wave")),))
     check("with heading mode off, nothing is covered anywhere",
-          EC.heading_control_coverage(FakeEnv("flat", heading=False)) == (0, 250))
-    prev = EC.disable_heading_command(flat)
+          EC.heading_control_coverage(FakeEnv("wave", heading=False)) == (0, 250))
+    wave = FakeEnv("wave")
+    prev = EC.disable_heading_command(wave)
     check("disabling reports the previous setting", prev is True)
     check("disabling actually clears the flag",
-          EC.heading_control_coverage(flat) == (0, 250))
+          EC.heading_control_coverage(wave) == (0, 250))
 
 
 def test_steer_brake_split_is_a_share():

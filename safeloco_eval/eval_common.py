@@ -55,7 +55,20 @@ CONTACT_FORCE_THRESH = 1.0       # foot considered in contact above this (N)
 TERRAIN_PROPORTIONS = {
     # 'flat' is used by the command-response calibration, which needs the
     # command interface measured without terrain or obstacles confounding it.
-    'flat':     [1.0, 0, 0, 0, 0, 0, 0, 0, 0],
+    #
+    # Proportion index 9 is the flattest thing this generator makes:
+    # random_uniform_terrain(+-0.05 m) and nothing else -- the same base the
+    # corridor is built on, minus the obstacles.  Index 0 is NOT flat, it is
+    # wave_terrain(num_waves=5); putting the calibration there had the robot
+    # crawling at 0.05 m/s against a 0.6 m/s command, which makes every
+    # tracking gain meaningless.
+    #
+    # Index 9 also puts roughflat_start_idx at 0, so the heading controller
+    # covers no env -- the same as the corridor, which is what the
+    # calibration is supposed to be informing.  Index 0 covered every env and
+    # overwrote the yaw command outright.
+    'flat':     [0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0],
+    'wave':     [1.0, 0, 0, 0, 0, 0, 0, 0, 0],
     'slope':    [0, 1.0, 0.0, 0, 0, 0, 0, 0, 0],
     'stair':    [0, 0, 1.0, 0, 0, 0, 0, 0, 0],
     'gap':      [0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0],
