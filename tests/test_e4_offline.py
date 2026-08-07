@@ -22,6 +22,7 @@ Run:  python tests/test_e4_offline.py
 
 import csv
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -390,6 +391,44 @@ def test_projection():
     check("no obstacles -> command untouched, not activated",
           bool(torch.allclose(out, env.commands)) and
           not bool(info["activated"][0]))
+
+    # ------------------------------------------------------------------
+    # Regression: the box belongs *inside* the projection, not after it.
+    #
+    # The filter solves for a point in (half-planes) INTERSECT (box).  The
+    # original code projected onto the half-plane and clamped afterwards,
+    # which broke twice over whenever the obstacle was off the heading and
+    # lateral velocity was pinned to zero (which it always is here):
+    #
+    #   * the clamp deleted the v_y part of the correction and left v_x
+    #     ABOVE what the constraint allowed -- the filter under-braked; and
+    #   * the residual was then positive, so the step was reported as "no
+    #     legal option" even though simply slowing to b/a_x was legal.
+    #
+    # Both matter for what was published: the second inflated the headline
+    # no-legal-option rate, and the first made the steel-man weaker than it
+    # was supposed to be.
+    for ang in (30, 45, 60):
+        rad = math.radians(ang)
+        env = FakeEnv([(0.8 * math.cos(rad), 0.8 * math.sin(rad))])
+        out, info = run(env, alpha=1.0, barrier="geometric",
+                        vx_range=(0.0, 0.8), vy_range=(0.0, 0.0))
+        f = CBFCommandFilter(alpha=1.0, barrier="geometric",
+                             vx_range=(0.0, 0.8), vy_range=(0.0, 0.0))
+        a, b, _, _ = f._constraints(env)
+        legal_vx = float(b[0, 0]) / float(a[0, 0, 0])
+        check("obstacle %d deg off heading: v_x respects the constraint" % ang,
+              float(out[0, 0]) <= legal_vx + 1e-4,
+              "vx=%.4f  legal<=%.4f" % (float(out[0, 0]), legal_vx))
+        check("obstacle %d deg off heading: not called infeasible" % ang,
+              not bool(info["infeasible"][0]))
+
+    # ...and infeasible must still fire when the safe set really is empty.
+    env = FakeEnv([(0.45, 0.0)])
+    _, info = run(env, alpha=1.0, barrier="geometric",
+                  vx_range=(0.0, 0.8), vy_range=(0.0, 0.0))
+    check("an obstacle already inside the barrier is genuinely infeasible",
+          bool(info["infeasible"][0]))
 
 
 def main():

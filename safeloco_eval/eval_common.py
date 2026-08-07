@@ -53,6 +53,9 @@ EVAL_TERRAIN_NUM_COLS = 1
 CONTACT_FORCE_THRESH = 1.0       # foot considered in contact above this (N)
 
 TERRAIN_PROPORTIONS = {
+    # 'flat' is used by the command-response calibration, which needs the
+    # command interface measured without terrain or obstacles confounding it.
+    'flat':     [1.0, 0, 0, 0, 0, 0, 0, 0, 0],
     'slope':    [0, 1.0, 0.0, 0, 0, 0, 0, 0, 0],
     'stair':    [0, 0, 1.0, 0, 0, 0, 0, 0, 0],
     'gap':      [0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0],
@@ -324,6 +327,7 @@ _ACC_FIELDS = [
     "n_steps", "n_collision_steps", "n_proximity_steps",
     "n_viol_steps", "return", "vel_err_sum",
     "lat_vel_sum", "fwd_vel_sum", "h_sum", "h_min", "activation_steps", "target_miss_steps",
+    "sum_dnorm_v", "sum_dnorm_omega",
     "trigger_steps", "sum_dnorm_inf", "max_dnorm_inf", "sum_dnorm_l2",
     "q_gap_sum", "q_gap_n", "peak_yaw", "peak_jerk", "handoffs",
     "steps_flight", "steps_partial", "steps_stance",
@@ -520,6 +524,9 @@ class EvalCollector(object):
                 self.acc.add("sum_dnorm_inf", cinfo["dnorm"], live)
                 self.acc.add_max("max_dnorm_inf", cinfo["dnorm"], live)
                 self.acc.add("infeasible_steps", cinfo["infeasible"], live)
+                if "dnorm_v" in cinfo:
+                    self.acc.add("sum_dnorm_v", cinfo["dnorm_v"], live)
+                    self.acc.add("sum_dnorm_omega", cinfo["dnorm_omega"], live)
 
             # ---- policy, then filter -------------------------------------
             with torch.no_grad():
@@ -640,6 +647,8 @@ class EvalCollector(object):
                 "min_h": a["h_min"][j],
                 "activation_steps": int(a["activation_steps"][j]),
                 "infeasible_steps": int(a["infeasible_steps"][j]),
+                "sum_dnorm_v": a["sum_dnorm_v"][j],
+                "sum_dnorm_omega": a["sum_dnorm_omega"][j],
                 "target_miss_steps": int(a["target_miss_steps"][j]),
                 "trigger_steps": int(a["trigger_steps"][j]),
                 "sum_dnorm_inf": a["sum_dnorm_inf"][j],

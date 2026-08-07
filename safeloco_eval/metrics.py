@@ -94,8 +94,8 @@ EPISODE_FIELDS = [
     "term_proj_grav_z", "term_base_z_rel", "term_base_vel_z",
     # --- secondary proximity diagnostic ---------------------------------
     "n_proximity_steps",
-    # --- E4 command-filter diagnostic (infeasible box, §1) ---------------
-    "infeasible_steps",
+    # --- command-filter diagnostics (E4 / E4-Y) --------------------------
+    "infeasible_steps", "sum_dnorm_v", "sum_dnorm_omega",
     # --- E1 filter diagnostics ------------------------------------------
     "trigger_steps", "sum_dnorm_inf", "max_dnorm_inf", "sum_dnorm_l2",
     "mean_q_gap", "n_q_gap",
@@ -353,6 +353,21 @@ def contact_per_metre(recs):
         return float("nan")
     steps = sum(float(r.get("n_collision_steps", 0) or 0) for r in recs) / len(recs)
     return steps / d
+
+
+def steer_brake_split(recs):
+    """(steer share, brake share) of total correction magnitude.
+
+    The command-space analogue of E1's gait-phase decomposition: it says
+    whether a filter given steering authority actually uses it, or quietly
+    falls back to braking.  Returns (nan, nan) when nothing was corrected.
+    """
+    sv = sum(float(r.get("sum_dnorm_v", 0) or 0) for r in recs)
+    sw = sum(float(r.get("sum_dnorm_omega", 0) or 0) for r in recs)
+    tot = sv + sw
+    if tot <= 0:
+        return (float("nan"), float("nan"))
+    return (sw / tot, sv / tot)
 
 
 def mean_fwd_vel(recs):

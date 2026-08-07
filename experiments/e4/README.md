@@ -67,6 +67,62 @@ relative degree two with respect to `h` and cannot appear in a first-order CBF
 constraint. Filtering it would be unsound, not conservative. Recorded in the
 manifest as `yaw_filtered: false`.
 
+> **Correction.** That paragraph is true of a barrier written on the base
+> centre, and false as a general statement — which is how it was read, and it
+> made this study unfair to the methods it was meant to steel-man. Put the
+> barrier on a **look-ahead point** `P = p + L·e(θ)` and `Ṗ = v·e + L·ω·e⊥`,
+> so `ω` enters at first order and the filter can genuinely steer. That is the
+> standard near-identity-diffeomorphism construction, and it is what OCR and
+> ABS actually do. See `experiments/e4y/`, which supersedes this study; the
+> filter here is its `--no_yaw --lookahead 0` arm.
+
+### Two corrections to the projection, and what they change
+
+Both were found while building E4-Y, and both affect numbers already reported
+here, so they are recorded rather than quietly fixed.
+
+**1. The command box belongs inside the projection loop, not after it.**
+The filter is solving for a point in (half-planes) ∩ (box). This code
+projected onto the half-plane and clamped to the box afterwards. Whenever the
+obstacle was off the heading — and lateral velocity is pinned to zero here, so
+the correction always had a `v_y` component to lose — the clamp deleted that
+component and left `v_x` **above** what the constraint allowed. Two
+consequences, in opposite directions:
+
+* the residual was then positive, so the step was reported **"no legal
+  option"** even though slowing to `b/a_x` was legal all along. The 91–100%
+  infeasibility rate quoted below is inflated by this, and is a property of
+  the solver as much as of the one-dimensional input space.
+* the executed command was **less conservative** than the constraint required
+  — the filter under-braked — so the steel-man was weaker than intended, which
+  cuts *against* this study's "dominated" conclusion rather than for it.
+
+On a 64-point sweep of triggered geometries (bearing 0–85°, range 0.6–1.0 m),
+the old ordering reported no-legal-option on 92% of cases where a legal
+command existed, and commanded a higher-than-legal speed on the same 92%;
+worst case, an obstacle 65° off the heading at 0.60 m got `v_x = 0.522` where
+`0.166` was the limit. Head-on approaches are unaffected, so the true effect
+on the run depends on the corridor's bearing distribution and needs a re-run
+to pin down.
+
+**2. Alternating projections converge too slowly to fix it by clamping in the
+loop.** The convergence rate is set by the angle between the half-plane and
+the box, and the near-tangent cases are exactly the ones that dominate the
+no-legal-option statistic; a dozen passes still reports feasible problems as
+infeasible. `project_halfplane_box` therefore solves each constraint-plus-box
+subproblem **exactly** — in two variables the emptiness test is a corner
+evaluation and the projection is a three-candidate active-set enumeration.
+Verified against brute force on 4,000 random instances: 0 feasibility errors,
+0 suboptimal projections.
+
+**What this means for the numbers below.** The gate outcome here rested on
+contact, return, speed and distance, not on the infeasibility rate, so the
+qualitative reading is not overturned by the fix. But the infeasibility rate
+*was* the mechanism story, and it needs re-measuring. Rather than re-running
+this study, run E4-Y: its `--no_yaw` arm is a properly-solved braking-only
+filter in the same harness, and `REPLICA_ALPHAS=... --lookahead 0` reproduces
+this exact filter if you want the like-for-like row.
+
 ### α
 
 α is the class-K gain. **Small α is more conservative** — it permits only slow
@@ -76,10 +132,17 @@ frontier. The default grid is `0.25 0.5 1.0 2.0 5.0`.
 ### Multiple obstacles
 
 Each obstacle contributes one half-plane. The filter cyclically projects onto
-the most-violated constraint until all are satisfied or `--max_passes` is
-exhausted; a residual violation is recorded as `infeasible_steps` (§1's
-Infeasibility %, with activation as the denominator). A QP solver would give
-the same answer for two variables and is not worth the dependency.
+the most-violated constraint **and the box together** until all are satisfied
+or `--max_passes` is exhausted. A step is `infeasible` when any single
+constraint is unsatisfiable inside the box (a closed-form corner test, so this
+is definitive) or when a residual violation survives the passes (the case
+where each constraint is individually satisfiable but not jointly). §1's
+Infeasibility %, with triggered steps as the denominator.
+
+A general QP solver would give the same answer for two variables and is not
+worth the dependency — but see the correction above: the per-constraint
+subproblem has to be solved *exactly*, not approximated by projecting and
+clamping.
 
 ### Command clamping, and what authority the filter actually has
 
