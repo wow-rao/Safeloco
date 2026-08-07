@@ -132,6 +132,35 @@ def apply_eval_overrides(env_cfg, train_cfg, terrain, num_envs, dr_mode="off",
     return env_cfg, train_cfg
 
 
+def check_run_exists(log_root, load_run):
+    """Fail early, and say what *is* there.
+
+    `get_load_path` resolves a missing run into `os.listdir` on a path that
+    does not exist, so a mistyped or absent checkpoint surfaces as a bare
+    FileNotFoundError from inside legged_gym with no indication of which run
+    was wanted or what the alternatives are.  Every one of these scripts
+    takes a `--load_run`, so that is a cheap thing to get right.
+    """
+    if load_run in (None, -1, "-1"):
+        return
+    path = os.path.join(log_root, str(load_run))
+    if os.path.isdir(path):
+        return
+    try:
+        available = sorted(d for d in os.listdir(log_root)
+                           if os.path.isdir(os.path.join(log_root, d)))
+    except OSError:
+        available = []
+    raise SystemExit(
+        "no such run: {}\n"
+        "  looked in : {}\n"
+        "  available : {}\n"
+        "Pass --load_run with one of the above, or point the sweep at it "
+        "(e.g. PI_OURS_RUN=... for the reference sweep).".format(
+            load_run, log_root,
+            ", ".join(available) if available else "(none)"))
+
+
 def build_env_and_policy(args, terrain, num_envs, dr_mode="off",
                          load_run=None, checkpoint=None):
     """Create the eval env and load the pinned checkpoint.
@@ -159,6 +188,7 @@ def build_env_and_policy(args, terrain, num_envs, dr_mode="off",
 
     log_root = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs',
                             train_cfg.runner.experiment_name)
+    check_run_exists(log_root, train_cfg.runner.load_run)
     resume_path = get_load_path(log_root, load_run=train_cfg.runner.load_run,
                                 checkpoint=train_cfg.runner.checkpoint)
 

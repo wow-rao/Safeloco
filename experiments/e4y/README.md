@@ -73,13 +73,19 @@ studies with different seeds and different code.
 ## Run it
 
 ```bash
-# 0. Strongly recommended first: same-harness reference rows.
-#    Without logs/reference/reference.json every "dominated by the proposed
-#    method" call is made against Table 2's 4.4%, which was measured with a
-#    different collision detector.  The analyser still runs, and shouts.
+# 0. OPTIONAL, and only if you have the paper's checkpoints.
+#    Same-harness reference rows need `pi_ours` and `pi_rs` — the proposed
+#    method and the reward-shaping baseline. Nothing in this package trains
+#    them, so most checkouts will not have them; the script now checks up
+#    front and tells you what is present instead of failing an hour in.
+#    Skip it if they are absent. Every analyser then falls back to Table 2's
+#    numbers and prints a warning that the comparison is cross-detector
+#    rather than like-for-like, which is a caveat on the writeup, not a
+#    blocker on the run.
 ./experiments/reference/sweep_reference.sh all
 
 # 1. Calibration — a GATE, and a result in its own right.  ~15 min.
+#    This only needs pi_nom.
 ./experiments/e4y/sweep_e4y.sh calibrate
 
 # 2. Sweep: unfiltered + α ∈ {1, 2, 5} × {yaw, no-yaw}, N = 1000.  ~4-6 h.

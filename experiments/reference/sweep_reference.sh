@@ -28,6 +28,33 @@ EVAL="--filter none --n_episodes ${N_EPISODES} --eval_envs ${EVAL_ENVS} --dr ${D
 
 stage="${1:-all}"
 
+# Preflight.  These two runs are the paper's policies, not anything this
+# package trains, so a fresh clone will not have them.  Check before spending
+# an hour discovering it, and be explicit that everything else still runs.
+LOG_ROOT="${LOG_ROOT:-logs/go1_viploco_warp_v5}"
+missing=""
+for r in "${PI_OURS_RUN}" "${PI_RS_RUN}"; do
+  [ -d "${LOG_ROOT}/${r}" ] || missing="${missing} ${r}"
+done
+if [ -n "${missing}" ]; then
+  echo "MISSING checkpoint run(s):${missing}"
+  echo "  looked in : ${LOG_ROOT}"
+  echo "  available : $(ls "${LOG_ROOT}" 2>/dev/null | tr '\n' ' ')"
+  echo
+  echo "These are the *paper's* policies -- the proposed method and the"
+  echo "reward-shaping baseline. Nothing in this package trains them, so a"
+  echo "checkout without them cannot produce same-harness reference rows."
+  echo
+  echo "This does NOT block E1, E2, E4 or E4-Y. Their analysers fall back to"
+  echo "Table 2's numbers and print a warning saying the comparison is"
+  echo "cross-detector rather than like-for-like. Run them now and come back"
+  echo "to this when the checkpoints exist."
+  echo
+  echo "If they exist under other names, point at them:"
+  echo "  PI_OURS_RUN=<run> PI_RS_RUN=<run> $0 ${stage}"
+  exit 1
+fi
+
 if [ "$stage" = "eval" ] || [ "$stage" = "all" ]; then
   mkdir -p "${OUT}"
   echo "=== reference: proposed method under this harness ==="
