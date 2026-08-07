@@ -201,3 +201,101 @@ def fmt_mean(m, s, digits=1):
     if math.isnan(s):
         return "{m:.{d}f}".format(m=m, d=digits)
     return "{m:.{d}f} ± {s:.{d}f}".format(m=m, s=s, d=digits)
+
+
+# ---------------------------------------------------------------------------
+# Clustered and paired inference (analysis_protocol.md §2, post-mortem item 2)
+# ---------------------------------------------------------------------------
+#
+# A pooled-timestep rate is not a binomial proportion over independent trials:
+# timesteps within an episode are heavily autocorrelated -- a colliding episode
+# in the corridor stays in contact for hundreds of consecutive steps.  Feeding
+# such a rate to `wilson_ci` gives intervals of +/-0.1% that no one should
+# believe.  Resample whole *episodes* instead, which is the unit that was
+# actually randomised.
+
+def cluster_bootstrap_rate_ci(recs, num_field, den_field, n_boot=2000, seed=0,
+                              alpha=0.05):
+    """Episode-clustered CI for a pooled rate `sum(num) / sum(den)`.
+
+    Resamples episodes with replacement, so the interval reflects
+    episode-level variation rather than pretending timesteps are independent.
+    Returns (point, lo, hi) as fractions.
+    """
+    import random as _random
+
+    num = [float(r.get(num_field, 0) or 0) for r in recs]
+    den = [float(r.get(den_field, 0) or 0) for r in recs]
+    tot_d = sum(den)
+    if not recs or tot_d <= 0:
+        return (float("nan"), 0.0, 1.0)
+    point = sum(num) / tot_d
+
+    rng = _random.Random(seed)
+    n = len(recs)
+    draws = []
+    for _ in range(n_boot):
+        sn = sd = 0.0
+        for _ in range(n):
+            j = rng.randrange(n)
+            sn += num[j]
+            sd += den[j]
+        if sd > 0:
+            draws.append(sn / sd)
+    if not draws:
+        return (point, 0.0, 1.0)
+    draws.sort()
+    lo = draws[int((alpha / 2) * len(draws))]
+    hi = draws[min(len(draws) - 1, int((1 - alpha / 2) * len(draws)))]
+    return (point, lo, hi)
+
+
+def mcnemar_paired(recs_a, recs_b, key=("chunk_idx", "env_idx"), flag=None):
+    """Paired comparison of a binary outcome across two matched conditions.
+
+    Initial conditions are paired across conditions (same chunk and env), so a
+    fall in condition A and a fall in condition B on the *same* start are not
+    independent observations.  McNemar uses only the discordant pairs, which
+    is where the information about a difference actually lives.
+
+    `flag(rec) -> bool` defaults to the shared fall definition.  Returns a dict
+    with the discordant counts, the rate difference, and an exact two-sided
+    binomial p-value computed without scipy.
+    """
+    from . import metrics as _M
+
+    fn = flag or _M.is_fall
+
+    def index(recs):
+        out = {}
+        for r in recs:
+            out[tuple(str(r.get(k, "")) for k in key)] = bool(fn(r))
+        return out
+
+    A, B = index(recs_a), index(recs_b)
+    shared = sorted(set(A) & set(B))
+    b = sum(1 for k in shared if A[k] and not B[k])     # A only
+    c = sum(1 for k in shared if B[k] and not A[k])     # B only
+    n_disc = b + c
+
+    # Exact two-sided sign test on the discordant pairs.
+    if n_disc == 0:
+        p = 1.0
+    else:
+        def comb(n, k):
+            r = 1
+            for i in range(k):
+                r = r * (n - i) // (i + 1)
+            return r
+        tail = sum(comb(n_disc, i) for i in range(min(b, c) + 1))
+        p = min(1.0, 2.0 * tail / (2.0 ** n_disc))
+
+    n_pairs = len(shared)
+    return {
+        "n_pairs": n_pairs,
+        "a_only": b, "b_only": c, "discordant": n_disc,
+        "rate_a": (sum(1 for k in shared if A[k]) / n_pairs) if n_pairs else float("nan"),
+        "rate_b": (sum(1 for k in shared if B[k]) / n_pairs) if n_pairs else float("nan"),
+        "diff": ((b - c) / n_pairs) if n_pairs else float("nan"),
+        "p_value": p,
+    }

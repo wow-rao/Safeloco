@@ -51,6 +51,9 @@ FALL_HEIGHT = 0.15
 #: An action-filter step counts as *active* when it actually moved the action.
 ACTIVATION_DNORM_THRESH = 1e-6
 
+#: Control period, seconds.  Only used to turn per-step speeds into distances.
+CONTROL_DT = 0.02
+
 #: Handoff-attributed falls (E3/J3): a fall this many seconds after a switch.
 HANDOFF_WINDOW_S = 0.5
 
@@ -317,3 +320,43 @@ def isfinite(x):
         return math.isfinite(float(x))
     except (TypeError, ValueError):
         return False
+
+
+def distance_travelled(recs):
+    """Mean forward distance per episode, metres.
+
+    Any intervention that changes the command can buy a lower contact rate by
+    going slower, so distance is reported next to every safety metric (E4
+    post-mortem).  Derived from realised speed and episode length, not from the
+    command, so a filter cannot flatter it.
+    """
+    if not recs:
+        return float("nan")
+    tot = 0.0
+    for r in recs:
+        v = float(r.get("mean_fwd_vel", 0) or 0)
+        n = float(r.get("n_steps", 0) or 0)
+        tot += v * n * CONTROL_DT
+    return tot / len(recs)
+
+
+def contact_per_metre(recs):
+    """Contact timesteps per metre travelled.
+
+    A per-timestep contact rate falls when the robot slows down even if its
+    behaviour near obstacles is unchanged; normalising by distance separates
+    the two.  This is what showed that a permissive command filter was
+    genuinely worse than no filter rather than merely slower.
+    """
+    d = distance_travelled(recs)
+    if not recs or not (d > 0):
+        return float("nan")
+    steps = sum(float(r.get("n_collision_steps", 0) or 0) for r in recs) / len(recs)
+    return steps / d
+
+
+def mean_fwd_vel(recs):
+    """Realised forward speed, immune to the command being rewritten."""
+    if not recs:
+        return float("nan")
+    return sum(float(r.get("mean_fwd_vel", 0) or 0) for r in recs) / len(recs)
