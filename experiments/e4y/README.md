@@ -119,9 +119,8 @@ ground with no obstacles, and writes `logs/e4y/calibration.json`:
   OCR/ABS *mechanism*, and the result is strong whichever way it lands.
 * **Degenerate gain** → E4-Y is a fair test of *retrofitting onto this
   policy*, and a weak test of the mechanism in its native setting. That has to
-  be said in the writeup, in those words. The fair version of the mechanism
-  test needs `π_nom` retrained with wider command ranges, which is expensive
-  and is future work.
+  be said in the writeup, in those words, and the mechanism test then needs a
+  baseline that can turn — `train_yaw_policy.py`.
 
 The calibration is publishable on its own either way: it turns "the retrofit
 has nowhere to steer" from an assertion into a measured property of the
@@ -145,8 +144,8 @@ the robot is walking; command drift 0.0%, so the setpoint arrived intact):
 *retrofitting a steering filter onto this policy*, and a weak test of the
 OCR/ABS mechanism in its native setting. That has to be said in the writeup
 in those words — it is not a caveat a reader should have to infer. The fair
-version of the mechanism test needs `π_nom` retrained with wider command
-ranges, which is expensive and is future work.
+version needs a baseline that can turn: see **The yaw-capable rerun** below,
+which is no longer future work.
 
 The turn radius is the sharpest single sentence available: steering-based
 evasion is **geometrically impossible in this corridor**, by a factor of
@@ -165,6 +164,48 @@ than braking; it can be **worse**. The sweep now logs `sum_yaw_cmd_abs` and
 analyser reports their ratio as prediction (v). If the yaw arm's contact rate
 comes out above the yaw-disabled arm's, that ratio is how you tell "steering
 was unhelpful" from "steering was never delivered".
+
+## The yaw-capable rerun
+
+The measured result above scopes what this study can claim. Command filtering
+doing *well* at collision avoidance is expected and uninteresting — it acts on
+a far higher-level interface than a joint-space method. The claim worth
+defending is the **soundness** one: that the fast configurations command a
+yaw the robot never executes, so the barrier certifies a twist that does not
+happen.
+
+That claim cannot be made from this sweep. It was measured on a policy that
+physically cannot turn, and a fragility claim tested only on a platform that
+cannot exercise the mechanism is not evidence. `train_yaw_policy.py` trains a
+baseline that can, so the study can be re-run against a real opponent. It
+makes the baseline stronger on purpose.
+
+**Two config fields, neither of them the obvious one:**
+
+| field | shipped | why |
+|---|---|---|
+| `flat_ang_vel_yaw` | `[-0.01, 0.01]` | **the range that actually governs.** Training uses `terrain_proportions = [0]*9 + [0.2, 0.8]`, so `sum(proportions[:9]) = 0` and `roughflat_start_idx = 0`. In `_resample_commands`, `heading_command = True` means the branch sampling `ang_vel_yaw` never runs, while `flat_env_ids = env_ids[env_ids >= 0]` selects *every* env. Heading control then covers `[:0]` = nobody, so nothing overwrites it. |
+| `tracking_ang_vel` | `0.0` | the yaw-tracking reward is switched off, so a wide range alone gives no gradient to follow it. |
+
+Widening `ang_vel_yaw` — the field anyone would reach for first — changes
+nothing at all. Both are set, the dead one for clarity.
+
+```bash
+python experiments/e4y/train_yaw_policy.py --task go1_amp --headless \
+    --max_iterations 2000 --seed 1          # writes to pi_nom_yaw
+
+# Gate before spending anything on a sweep:
+python experiments/e4y/calibrate_commands.py --task go1_amp --headless \
+    --load_run pi_nom_yaw --out logs/e4y/calibration_yaw.json
+#   forward tracking gain ~1.0  -> it still walks
+#   yaw tracking gain >> 0.015  -> it can now turn
+
+PI_NOM_RUN=pi_nom_yaw OMEGA_LIMIT=1.0 ./experiments/e4y/sweep_e4y.sh sweep
+```
+
+It trains to its **own** run directory. `pi_nom` is the shared baseline behind
+every completed study; a policy with different command ranges is a different
+robot, and replacing it would invalidate rows already analysed.
 
 ## Registered predictions
 
