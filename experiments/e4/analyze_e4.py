@@ -73,6 +73,7 @@ def load_rows(directory):
             "ret": ST.mean_ci(M.per_episode(recs, "return")),
             "vel_err": ST.mean_ci(M.per_episode(recs, "vel_err")),
             "lat_vel": ST.mean_ci(M.per_episode(recs, "mean_lat_vel")),
+            "fwd_vel": ST.mean_ci(M.per_episode(recs, "mean_fwd_vel")),
         }
         if alpha is None:
             unfiltered = row
@@ -84,8 +85,18 @@ def load_rows(directory):
 
 # ------------------------------------------------------------------- gate --
 
-def classify(row):
+#: A filter that stops the robot trivially avoids collisions (§1's first
+#: cross-cutting rule).  Below this fraction of the unfiltered forward speed,
+#: the safety numbers describe a stationary robot and the row is not a
+#: meaningful point on the frontier.
+TRIVIAL_STOP_FRACTION = 0.5
+
+
+def classify(row, fwd_ref=None):
     """Per-row comparison against our Pareto point, on the three scored axes."""
+    if fwd_ref is not None and fwd_ref > 1e-6:
+        if row["fwd_vel"][0] < TRIVIAL_STOP_FRACTION * fwd_ref:
+            return "trivial_stop"
     c, r, v = row["collision"][0], row["ret"][0], row["vel_err"][0]
     better_or_equal = (c <= M.OURS_COLLISION_RATE and r >= M.OURS_RETURN
                        and v <= M.OURS_MEAN_LAT_VEL)
@@ -98,15 +109,22 @@ def classify(row):
     return "mixed"
 
 
-def apply_gate(rows):
+def apply_gate(rows, unfiltered=None):
+    fwd_ref = unfiltered["fwd_vel"][0] if unfiltered else None
     per_row = {}
     for row in rows:
-        per_row["alpha={:g}".format(row["alpha"])] = classify(row)
+        per_row["alpha={:g}".format(row["alpha"])] = classify(row, fwd_ref)
 
     kinds = set(per_row.values())
-    if "matches_or_dominates" in kinds:
+    live = kinds - {"trivial_stop"}
+    if kinds and kinds == {"trivial_stop"}:
+        # Every row stopped the robot: collision, fall and velocity error all
+        # describe a stationary machine, and return is measured against a
+        # command the filter rewrote.  There is no frontier point to gate on.
+        outcome = 0
+    elif "matches_or_dominates" in live:
         outcome = 3
-    elif kinds and kinds == {"dominated_by_ours"}:
+    elif live and live == {"dominated_by_ours"}:
         outcome = 1
     else:
         outcome = 2
@@ -120,6 +138,15 @@ def apply_gate(rows):
                       "vel_err": M.OURS_MEAN_LAT_VEL,
                       "lat_vel": M.OURS_MEAN_LAT_VEL},
         "best_collision_row": ("alpha={:g}".format(best["alpha"]) if best else None),
+        "unfiltered_fwd_vel": fwd_ref,
+        "trivial_stop_threshold": (TRIVIAL_STOP_FRACTION * fwd_ref
+                                   if fwd_ref else None),
+        "return_reference_warning": (
+            "Return is computed by the env against env.commands, which a "
+            "command filter rewrites. A filter that lowers the command is "
+            "scored against the easier command and its return rises. Do not "
+            "compare a filtered return against ours without accounting for "
+            "this."),
         "scored_axes": ["collision", "return", "vel_err"],
         "reported_not_scored": ["mean_lat_vel"],
     }
@@ -150,6 +177,11 @@ def sanity_checks(rows, unfiltered):
 # ----------------------------------------------------------------- output --
 
 S7 = {
+    0: ("Command-space filtering, applied to this policy, avoids collisions by "
+        "bringing the robot to a halt: forward speed collapses to a fraction "
+        "of nominal and the safety numbers describe a stationary machine. No "
+        "usable point on the frontier was produced, so the taxonomy row is "
+        "reported with that caveat rather than as a competitive baseline."),
     1: ("Command-space filtering -- the form these methods actually take -- is "
         "included as a baseline; it is dominated by ours on collision rate, "
         "return and velocity tracking simultaneously, and cannot express "
@@ -176,14 +208,15 @@ def trade_phrase(rows):
 
 
 def table(rows, unfiltered):
-    head = ("| alpha | Collision % ↓ | Fall % ↓ | Return ↑ | Vel. err ↓ | "
-            "\\|lat vel\\| | Activation % | Infeas. % |")
-    out = [head, "|---|---|---|---|---|---|---|---|"]
+    head = ("| alpha | Collision % ↓ | Fall % ↓ | **Fwd vel** ↑ | Return ↑† | "
+            "Vel. err ↓ | \\|lat vel\\| | Activation % | Infeas. % |")
+    out = [head, "|---|---|---|---|---|---|---|---|---|"]
 
     def line(label, r):
-        return "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+        return "| {} | {} | {} | **{:.3f}** | {} | {} | {} | {} | {} |".format(
             label,
             ST.fmt_rate(*r["collision"]), ST.fmt_rate(*r["fall"]),
+            r["fwd_vel"][0],
             ST.fmt_mean(r["ret"][0], r["ret"][1]),
             ST.fmt_mean(r["vel_err"][0], r["vel_err"][1], digits=3),
             ST.fmt_mean(r["lat_vel"][0], r["lat_vel"][1], digits=3),
@@ -193,10 +226,14 @@ def table(rows, unfiltered):
         out.append(line("unfiltered", unfiltered))
     for r in rows:
         out.append(line("{:g}".format(r["alpha"]), r))
-    out.append("| **ours (reference)** | **{:.1f}** | — | **{:.1f}** | "
+    out.append("| **ours (reference)** | **{:.1f}** | — | — | **{:.1f}** | "
                "**{:.3f}** | {:.3f} | — | — |".format(
                    100 * M.OURS_COLLISION_RATE, M.OURS_RETURN,
                    M.OURS_MEAN_LAT_VEL, M.OURS_MEAN_LAT_VEL))
+    out.append("")
+    out.append("† Return is computed against `env.commands`, which the command "
+               "filter rewrites; a filter that lowers the command is scored "
+               "against the easier command. Not comparable across rows.")
     return "\n".join(out)
 
 
@@ -206,7 +243,7 @@ def main():
     if not rows and unfiltered is None:
         raise SystemExit("no E4 CSVs found in {}".format(args.dir))
 
-    gate = apply_gate(rows)
+    gate = apply_gate(rows, unfiltered)
     checks = sanity_checks(rows, unfiltered)
 
     print(table(rows, unfiltered))

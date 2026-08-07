@@ -51,7 +51,8 @@ def check(name, cond, detail=""):
 # ------------------------------------------------------------ synthesising --
 
 def make_records(n, coll_frac, fall_p, ret, vel_err, lat_vel, alpha,
-                 activation_frac=0.0, infeasible_frac=0.0, steps=1000):
+                 activation_frac=0.0, infeasible_frac=0.0, steps=1000,
+                 fwd_vel=0.58):
     recs = []
     for i in range(n):
         r = M.blank_record()
@@ -68,6 +69,7 @@ def make_records(n, coll_frac, fall_p, ret, vel_err, lat_vel, alpha,
         r["return"] = ret
         r["vel_err"] = vel_err
         r["mean_lat_vel"] = lat_vel
+        r["mean_fwd_vel"] = fwd_vel
         # fall is recomputed from the terminal pose, so drive it that way
         r["term_proj_grav_z"] = -0.2 if i < int(fall_p * n) else -0.99
         r["term_base_z_rel"] = 0.30
@@ -76,10 +78,13 @@ def make_records(n, coll_frac, fall_p, ret, vel_err, lat_vel, alpha,
 
 
 def write_world(directory, spec):
-    """spec: list of (alpha|None, coll, fall_p, ret, vel_err, lat, act, infeas)"""
+    """spec: (alpha|None, coll, fall_p, ret, vel_err, lat, act, infeas[, fwd])"""
     os.makedirs(directory, exist_ok=True)
-    for alpha, c, f, ret, ve, lat, act, inf in spec:
-        recs = make_records(120, c, f, ret, ve, lat, alpha, act, inf)
+    for entry in spec:
+        alpha, c, f, ret, ve, lat, act, inf = entry[:8]
+        fwd = entry[8] if len(entry) > 8 else 0.58
+        recs = make_records(120, c, f, ret, ve, lat, alpha, act, inf,
+                            fwd_vel=fwd)
         name = "unfiltered" if alpha is None else "cbf_alpha%g" % alpha
         with open(os.path.join(directory, "pi_nom_%s.csv" % name),
                   "w", newline="") as fh:
@@ -101,7 +106,7 @@ def test_outcome_1(tmp):
         (2.0, 0.110, 0.02, 29.0, 0.16, 0.05, 0.10, 0.0),
     ])
     rows, unf = A.load_rows(d)
-    g = A.apply_gate(rows)
+    g = A.apply_gate(rows, unf)
     check("all rows worse on three axes -> outcome 1", g["outcome"] == 1,
           "got %r (%r)" % (g["outcome"], g["per_row"]))
     check("unfiltered row is separated out", unf is not None)
@@ -116,8 +121,8 @@ def test_outcome_3(tmp):
         (0.5, 0.030, 0.02, 34.5, 0.070, 0.09, 0.40, 0.0),
         (2.0, 0.110, 0.02, 29.0, 0.160, 0.05, 0.10, 0.0),
     ])
-    rows, _ = A.load_rows(d)
-    g = A.apply_gate(rows)
+    rows, unf = A.load_rows(d)
+    g = A.apply_gate(rows, unf)
     check("a dominating row -> outcome 3", g["outcome"] == 3,
           "got %r (%r)" % (g["outcome"], g["per_row"]))
     check("the dominating row is identified",
@@ -131,8 +136,8 @@ def test_outcome_2(tmp):
         (None, 0.118, 0.02, 29.9, 0.148, 0.049, 0.0, 0.0),
         (0.5, 0.035, 0.05, 26.0, 0.30, 0.12, 0.55, 0.0),
     ])
-    rows, _ = A.load_rows(d)
-    g = A.apply_gate(rows)
+    rows, unf = A.load_rows(d)
+    g = A.apply_gate(rows, unf)
     check("better collision but worse return/vel-err -> outcome 2",
           g["outcome"] == 2, "got %r (%r)" % (g["outcome"], g["per_row"]))
     check("that row is classified mixed, not dominating",
@@ -148,13 +153,41 @@ def test_lat_vel_is_not_scored(tmp):
             (None, 0.118, 0.02, 29.9, 0.148, 0.049, 0.0, 0.0),
             (1.0, 0.030, 0.02, 34.5, 0.070, lat, 0.4, 0.0),
         ])
-        rows, _ = A.load_rows(d)
-        outcomes.append(A.apply_gate(rows)["outcome"])
+        rows, unf = A.load_rows(d)
+        outcomes.append(A.apply_gate(rows, unf)["outcome"])
     check("lateral velocity does not change the gate",
           outcomes[0] == outcomes[1], "got %r" % (outcomes,))
     check("lateral velocity is declared unscored",
           "mean_lat_vel" in A.apply_gate(
-              A.load_rows(os.path.join(tmp, "wlat0"))[0])["reported_not_scored"])
+              *A.load_rows(os.path.join(tmp, "wlat0")))["reported_not_scored"])
+
+
+def test_trivial_stop_is_not_a_frontier_point(tmp):
+    """§1 rule (i): a filter that stops the robot trivially avoids collisions.
+
+    The first real E4 sweep produced exactly this -- collision 0.0%, return
+    *up*, velocity error *down* -- because the filter had ratcheted the
+    command to zero and every metric was being read against the command it
+    had rewritten.  A row whose forward speed has collapsed must not be
+    allowed to count as dominating.
+    """
+    d = os.path.join(tmp, "wstop")
+    write_world(d, [
+        (None, 0.118, 0.02, 29.9, 0.148, 0.049, 0.0, 0.0, 0.58),
+        # looks perfect on every scored axis, but is standing still
+        (0.5, 0.000, 0.001, 38.6, 0.043, 0.009, 0.30, 0.85, 0.02),
+    ])
+    rows, unf = A.load_rows(d)
+    g = A.apply_gate(rows, unf)
+    check("a stopped robot is classified trivial_stop, not dominating",
+          g["per_row"]["alpha=0.5"] == "trivial_stop",
+          "got %r" % g["per_row"])
+    check("all rows stopped -> gate is not decidable (outcome 0)",
+          g["outcome"] == 0, "got %r" % g["outcome"])
+    check("the same row would have dominated without the guard",
+          A.classify(rows[0], None) == "matches_or_dominates")
+    check("gate records the return-reference warning",
+          "rewrites" in g["return_reference_warning"])
 
 
 def test_infeasibility_denominator():
@@ -336,6 +369,7 @@ def main():
         test_outcome_3(tmp)
         test_outcome_2(tmp)
         test_lat_vel_is_not_scored(tmp)
+        test_trivial_stop_is_not_a_frontier_point(tmp)
         print("\n[§1 metrics]")
         test_infeasibility_denominator()
         test_infeasible_cannot_exceed_trigger()

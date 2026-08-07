@@ -66,7 +66,10 @@ if [ "$stage" = "package" ] || [ "$stage" = "all" ]; then
   if [ -f "${SWEEP_DIR}/${PI_NOM_RUN}_unfiltered.csv" ]; then n=$((n + 1)); fi
   for a in ${ALPHAS}; do
     exp=$((exp + 1))
-    base="${PI_NOM_RUN}_cbf_alpha${a}"
+    # run_e4 names files with %g, so 1.0 becomes "alpha1"; normalise or the
+    # package silently omits every whole-numbered alpha.
+    ag="$(printf '%g' "${a}")"
+    base="${PI_NOM_RUN}_cbf_alpha${ag}"
     take "${SWEEP_DIR}/${base}.csv" "${PKG}/sweep"
     take "${SWEEP_DIR}/${base}.manifest.json" "${PKG}/sweep"
     if [ -f "${SWEEP_DIR}/${base}.csv" ]; then n=$((n + 1)); fi

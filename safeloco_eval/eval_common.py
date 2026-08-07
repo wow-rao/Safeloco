@@ -323,7 +323,7 @@ def env_has_collision_geometry(env):
 _ACC_FIELDS = [
     "n_steps", "n_collision_steps", "n_proximity_steps",
     "n_viol_steps", "return", "vel_err_sum",
-    "lat_vel_sum", "h_sum", "h_min", "activation_steps", "target_miss_steps",
+    "lat_vel_sum", "fwd_vel_sum", "h_sum", "h_min", "activation_steps", "target_miss_steps",
     "trigger_steps", "sum_dnorm_inf", "max_dnorm_inf", "sum_dnorm_l2",
     "q_gap_sum", "q_gap_n", "peak_yaw", "peak_jerk", "handoffs",
     "steps_flight", "steps_partial", "steps_stance",
@@ -456,6 +456,25 @@ class EvalCollector(object):
         self.rt.reset(obs)
         self.acc.reset_all()
 
+        # The nominal task command, captured before any filtering.  A command
+        # filter overwrites env.commands so the policy tracks the filtered
+        # value; without this snapshot the next step would filter its own
+        # previous output, ratcheting the command down monotonically instead
+        # of re-deciding it from the task command each step.  The eval config
+        # pins the command ranges to constants, so one snapshot per chunk is
+        # exact -- asserted rather than assumed.
+        self._nominal_cmd = None
+        if self.cmd_filt is not None:
+            self._nominal_cmd = env.commands.clone()
+            rng = env.cfg.commands.ranges
+            for attr in ("lin_vel_x", "lin_vel_y"):
+                lo, hi = getattr(rng, attr, [0.0, 0.0])
+                if abs(hi - lo) > 1e-9:
+                    raise RuntimeError(
+                        "command filter assumes a pinned eval command, but "
+                        "{} is [{}, {}]; snapshotting the nominal once per "
+                        "chunk would be wrong.".format(attr, lo, hi))
+
         live = torch.ones(env.num_envs, device=env.device)   # first episode?
         finished = torch.zeros(env.num_envs, dtype=torch.bool,
                                device=env.device)
@@ -468,9 +487,17 @@ class EvalCollector(object):
 
             # ---- pre-step state metrics (state the policy acts on) -------
             self.acc.add("n_viol_steps", self._joint_violation(), live)
-            v_err = (env.base_lin_vel[:, 0] - env.commands[:, 0]).abs()
+            # Referenced to the *nominal* task command.  Measuring against
+            # env.commands would let a command filter drive its own error to
+            # zero by lowering the command it is scored against.
+            cmd_ref = (self._nominal_cmd[:, 0] if self._nominal_cmd is not None
+                       else env.commands[:, 0])
+            v_err = (env.base_lin_vel[:, 0] - cmd_ref).abs()
             self.acc.add("vel_err_sum", v_err, live)
             self.acc.add("lat_vel_sum", env.base_lin_vel[:, 1].abs(), live)
+            # Actual forward speed: immune to the command being rewritten, so
+            # this is what exposes a filter that simply stops the robot.
+            self.acc.add("fwd_vel_sum", env.base_lin_vel[:, 0], live)
             self.acc.add_max("peak_yaw", env.base_ang_vel[:, 2].abs(), live)
             flight, partial, stance = self._contact_bucket()
 
@@ -482,7 +509,7 @@ class EvalCollector(object):
             # apply_eval_overrides turns observation noise off, so re-running
             # compute_observations cannot resample anything.
             if self.cmd_filt is not None:
-                cmd_new, cinfo = self.cmd_filt.apply(env.commands, env)
+                cmd_new, cinfo = self.cmd_filt.apply(self._nominal_cmd, env)
                 env.commands[:, :3] = cmd_new[:, :3]
                 env.compute_observations()
                 obs = env.obs_buf
@@ -608,6 +635,7 @@ class EvalCollector(object):
                 "return": a["return"][j],
                 "vel_err": a["vel_err_sum"][j] / n,
                 "mean_lat_vel": a["lat_vel_sum"][j] / n,
+                "mean_fwd_vel": a["fwd_vel_sum"][j] / n,
                 "mean_h": a["h_sum"][j] / n,
                 "min_h": a["h_min"][j],
                 "activation_steps": int(a["activation_steps"][j]),

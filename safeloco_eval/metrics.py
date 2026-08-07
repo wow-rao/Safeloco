@@ -83,6 +83,7 @@ EPISODE_FIELDS = [
     "run_id", "method", "variant", "epsilon_or_alpha", "seed", "episode_idx",
     "terrain", "collided", "n_collision_steps", "n_viol_steps", "n_steps",
     "fell", "return", "vel_err", "mean_lat_vel", "mean_h", "min_h",
+    "mean_fwd_vel",
     "activation_steps", "target_miss_steps", "handoffs", "peak_yaw",
     "peak_jerk",
     # --- termination diagnostics (so `fell` is recomputable post hoc) ----
