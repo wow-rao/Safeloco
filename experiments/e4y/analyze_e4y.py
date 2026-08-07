@@ -48,6 +48,13 @@ def parse_args():
     p.add_argument("--out", type=str, default="logs/e4y/R1d")
     p.add_argument("--reference", type=str, default=None)
     p.add_argument("--n_boot", type=int, default=2000)
+    p.add_argument("--ignore_return", action="store_true",
+                   help="drop the return axis from the gate. Required when "
+                        "the evaluated policy was trained under a different "
+                        "reward function from the reference -- a yaw-capable "
+                        "baseline adds a tracking_ang_vel term, so its return "
+                        "is not on the reference's scale. Auto-enabled when "
+                        "the manifests say so.")
     return p.parse_args()
 
 
@@ -101,7 +108,28 @@ def load_rows(directory, n_boot=2000):
     return rows, unfiltered
 
 
-def classify(row, ref, unf):
+def reward_function_matches(directory):
+    """False when the sweep's policy was trained under a different reward.
+
+    Table 2's return was measured with `tracking_ang_vel = 0`. A yaw-capable
+    baseline needs that term non-zero to learn to turn at all, which shifts
+    the whole return scale -- so comparing its return against the reference's
+    is comparing two different objectives, and the gate must not score it.
+    """
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".manifest.json"):
+            continue
+        try:
+            with open(os.path.join(directory, name)) as fh:
+                m = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if float(m.get("tracking_ang_vel", 0.0) or 0.0) != 0.0:
+            return False
+    return True
+
+
+def classify(row, ref, unf, ignore_return=False):
     if unf and unf["fwd_vel"] > 1e-6:
         if row["fwd_vel"] < TRIVIAL_STOP_FRACTION * unf["fwd_vel"]:
             return "trivial_stop"
@@ -119,7 +147,7 @@ def classify(row, ref, unf):
     elif unf:
         speed_ok = row["fwd_vel"] >= SPEED_TOLERANCE * unf["fwd_vel"]
     dist_ok = (row["distance"] >= SPEED_TOLERANCE * ref_dist) if ref_dist else speed_ok
-    ret_ok = (rr is None) or (row["ret"][0] >= rr)
+    ret_ok = ignore_return or (rr is None) or (row["ret"][0] >= rr)
 
     if beats_contact and speed_ok and dist_ok and ret_ok:
         return "matches_or_dominates"
@@ -128,8 +156,9 @@ def classify(row, ref, unf):
     return "dominated_by_reference"
 
 
-def apply_gate(rows, unfiltered, ref):
-    per_row = {r["label"]: classify(r, ref, unfiltered) for r in rows}
+def apply_gate(rows, unfiltered, ref, ignore_return=False):
+    per_row = {r["label"]: classify(r, ref, unfiltered, ignore_return)
+               for r in rows}
     kinds = set(per_row.values())
     live = kinds - {"trivial_stop"}
     if kinds and kinds == {"trivial_stop"}:
@@ -155,6 +184,7 @@ def apply_gate(rows, unfiltered, ref):
         "outcome": outcome,
         "per_row": per_row,
         "reference_measured": ref.get("measured", False),
+        "return_axis_scored": not ignore_return,
         "reference": ref.get("ours", {}),
         # Registered prediction (i): the no-legal-option rate was an artifact
         # of a one-dimensional input, so it should fall once yaw is available.
@@ -217,9 +247,17 @@ def main():
     rows, unfiltered = load_rows(args.dir, args.n_boot)
     if not rows and unfiltered is None:
         raise SystemExit("no E4-Y CSVs found in {}".format(args.dir))
-    gate = apply_gate(rows, unfiltered, ref)
+
+    ignore_return = args.ignore_return or not reward_function_matches(args.dir)
+    gate = apply_gate(rows, unfiltered, ref, ignore_return)
 
     print(banner(ref))
+    if ignore_return:
+        print("NOTE: the return axis is NOT scored. The evaluated policy was "
+              "trained with a tracking_ang_vel term the reference did not "
+              "have, so the two returns measure different objectives and "
+              "comparing them would be meaningless. Contact, speed and "
+              "distance are unaffected and still decide the gate.")
     print()
     print(table(rows, unfiltered, ref))
 

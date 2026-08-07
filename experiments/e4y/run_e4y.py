@@ -195,6 +195,17 @@ def main():
             cmd_filt.required_clearance(0.3)
             if hasattr(cmd_filt, "required_clearance") else None),
         policy_tag=ARGS.policy_tag,
+        # The reward function the evaluated policy was trained under.  A
+        # yaw-capable baseline adds a tracking_ang_vel term, so its `return`
+        # is on a different scale from pi_nom's and from Table 2's -- the
+        # analyser reads this and refuses to score the return axis across a
+        # mismatch rather than comparing two different reward functions.
+        eval_reward_scales={
+            k: float(v) for k, v in
+            vars(type(env_cfg.rewards.scales)).items()
+            if not k.startswith("_") and isinstance(v, (int, float))},
+        tracking_ang_vel=float(getattr(env_cfg.rewards.scales,
+                                       "tracking_ang_vel", 0.0)),
         checkpoint=resume_path, checkpoint_sha=EC.sha256_file(resume_path),
         terrain=ARGS.eval_terrain, dr_mode=ARGS.dr,
         collision_metric=("geometric_link_cylinder"
