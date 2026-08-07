@@ -90,6 +90,7 @@ def load_rows(directory, n_boot=2000):
             "distance": M.distance_travelled(recs),
             "contact_per_m": M.contact_per_metre(recs),
             "steer_share": steer,
+            "yaw_exec": M.yaw_execution_gain(recs),
             "_recs": recs,
         }
         if alpha is None:
@@ -161,6 +162,7 @@ def apply_gate(rows, unfiltered, ref):
         "infeasibility_noyaw": mean_of(noyaw_rows, "infeasible"),
         # Registered prediction (iv): the filter should actually use the axis.
         "steer_share_yaw": mean_of(yaw_rows, "steer_share"),
+        "yaw_exec_yaw": mean_of(yaw_rows, "yaw_exec"),
         "contact_yaw": mean_of(yaw_rows, "collision"),
         "contact_noyaw": mean_of(noyaw_rows, "collision"),
     }
@@ -232,6 +234,18 @@ def main():
     print("  (ii)  contact  yaw {:.2f}%  vs  yaw-disabled {:.2f}%"
           .format(100 * cy, 100 * cn))
     print("        -> {}".format("HELD" if cy < cn else "NOT held"))
+    ye = gate["yaw_exec_yaw"]
+    print("  (v)   yaw actually executed: {:.0f}% of what was commanded"
+          .format(100 * ye) if ye == ye else
+          "  (v)   yaw execution: n/a, no yaw was commanded")
+    if ye == ye and ye < 0.5:
+        print("        -> the platform does NOT track the yaw the filter asks")
+        print("           for. The CBF certifies a twist it assumes is")
+        print("           executed, so its guarantee does not hold here, and")
+        print("           the filter will have braked less than a braking-only")
+        print("           filter would on the strength of steering that never")
+        print("           happened. Read a WORSE contact rate on the yaw arm")
+        print("           as this, not as steering being unhelpful.")
     ss = gate["steer_share_yaw"]
     print("  (iv)  share of correction spent steering: {:.0f}%"
           .format(100 * ss if ss == ss else 0))

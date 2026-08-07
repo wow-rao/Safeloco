@@ -127,6 +127,45 @@ The calibration is publishable on its own either way: it turns "the retrofit
 has nowhere to steer" from an assertion into a measured property of the
 command interface.
 
+## Measured calibration result — read this before the predictions
+
+Run on `pi_nom`, all three validity gates green (forward tracking 1.09, so
+the robot is walking; command drift 0.0%, so the setpoint arrived intact):
+
+| | |
+|---|---|
+| trained `ang_vel_yaw` | `[-0.01, 0.01]` — essentially straight-ahead only |
+| trained `lin_vel_y` | `[0, 0]` — no lateral command was ever trained |
+| yaw tracking gain | **0.015** (±1.0 rad/s commanded → 0.020 rad/s realised) |
+| lateral tracking gain | −0.004 |
+| max realised yaw rate | 0.020 rad/s, ≈ twice the trained bound |
+| min turn radius @ 0.6 m/s | **29.8 m**, against a 2.5 m corridor |
+
+**This policy cannot turn on command.** So E4-Y is a fair test of
+*retrofitting a steering filter onto this policy*, and a weak test of the
+OCR/ABS mechanism in its native setting. That has to be said in the writeup
+in those words — it is not a caveat a reader should have to infer. The fair
+version of the mechanism test needs `π_nom` retrained with wider command
+ranges, which is expensive and is future work.
+
+The turn radius is the sharpest single sentence available: steering-based
+evasion is **geometrically impossible in this corridor**, by a factor of
+twelve, and that was known before the sweep ran rather than inferred from it.
+
+### What this does to the filter's guarantee
+
+A CBF certifies a twist `(v, ω)` on the assumption the twist is executed. If
+ω is ~98% ignored, the executed motion does not satisfy the constraint that
+was certified — and the filter will have **braked less** than a braking-only
+filter would, on the strength of steering that never happened.
+
+So a steering filter on a platform that cannot steer is not merely no better
+than braking; it can be **worse**. The sweep now logs `sum_yaw_cmd_abs` and
+`sum_yaw_realised_abs` over the steps where yaw was commanded, and the
+analyser reports their ratio as prediction (v). If the yaw arm's contact rate
+comes out above the yaw-disabled arm's, that ratio is how you tell "steering
+was unhelpful" from "steering was never delivered".
+
 ## Registered predictions
 
 Registered before the sweep runs, per §1.3 of the completion plan.
@@ -137,6 +176,7 @@ Registered before the sweep runs, per §1.3 of the completion plan.
 | (ii) | Contact falls below the braking-only filter's 12.1% **at matched speed** |
 | (iii) | It still does not reach the joint frontier: either contact stays above the same-harness reference, or realised speed and distance fall materially short |
 | (iv) | The steer/brake decomposition shows a substantial share of correction going to yaw — i.e. the filter actually uses the new axis |
+| (v) | **Added after calibration.** The commanded yaw is not executed (execution gain ≪ 1), so the certified twist is not the twist that happens. If the yaw arm's contact rate exceeds the yaw-disabled arm's, this is why. |
 
 **Falsification:** some α reaches contact ≤ the reference at comparable speed,
 distance and return. If that happens it gets reported plainly — see the gate.

@@ -96,6 +96,12 @@ EPISODE_FIELDS = [
     "n_proximity_steps",
     # --- command-filter diagnostics (E4 / E4-Y) --------------------------
     "infeasible_steps", "sum_dnorm_v", "sum_dnorm_omega",
+    # Commanded vs realised yaw rate, on steps where the filter asked for
+    # yaw. A CBF certifies a twist assuming the twist is executed; if the
+    # policy cannot track the yaw it was given, the executed motion does not
+    # satisfy the constraint the filter certified, and the filter has braked
+    # less on the strength of steering that never happened.
+    "sum_yaw_cmd_abs", "sum_yaw_realised_abs", "yaw_cmd_steps",
     # --- E1 filter diagnostics ------------------------------------------
     "trigger_steps", "sum_dnorm_inf", "max_dnorm_inf", "sum_dnorm_l2",
     "mean_q_gap", "n_q_gap",
@@ -375,3 +381,23 @@ def mean_fwd_vel(recs):
     if not recs:
         return float("nan")
     return sum(float(r.get("mean_fwd_vel", 0) or 0) for r in recs) / len(recs)
+
+
+def yaw_execution_gain(recs):
+    """Realised yaw rate / commanded yaw rate, over steps where yaw was asked.
+
+    A CBF certifies a twist on the assumption the twist is executed.  If the
+    policy cannot track the yaw the filter hands it, the executed motion does
+    not satisfy the constraint that was certified -- and worse, the filter
+    will have braked *less* than a braking-only filter would, on the strength
+    of steering that never happened.  So a steering filter on a platform that
+    cannot steer is not merely no better than braking; it can be worse.
+
+    Returns nan when the filter never commanded yaw, which is the correct
+    answer for the yaw-disabled arm rather than a misleading zero.
+    """
+    cmd = sum(float(r.get("sum_yaw_cmd_abs", 0) or 0) for r in recs)
+    real = sum(float(r.get("sum_yaw_realised_abs", 0) or 0) for r in recs)
+    if cmd <= 1e-9:
+        return float("nan")
+    return real / cmd
