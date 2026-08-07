@@ -132,6 +132,41 @@ def apply_eval_overrides(env_cfg, train_cfg, terrain, num_envs, dr_mode="off",
     return env_cfg, train_cfg
 
 
+def heading_control_coverage(env):
+    """How many envs have their yaw-rate command overwritten by the env.
+
+    With `commands.heading_command = True`, `_post_physics_step_callback`
+    recomputes `commands[:, 2]` every step from the heading error, for envs
+    `[:roughflat_start_idx]`.  Anything written to that column for those envs
+    is discarded, silently.
+
+    The slice bound is `ceil(num_envs * sum(terrain_proportions[:9]))`, so it
+    depends on the terrain:
+
+        corridor  proportions[10] = 1  ->  bound 0, nobody is covered
+        flat      proportions[0]  = 1  ->  bound N, everybody is covered
+
+    which is why a command-response calibration on flat ground measures a yaw
+    tracking gain of zero no matter what the policy can do, while the corridor
+    sweep it is meant to inform is unaffected.  Returns (n_covered, n_envs).
+    """
+    if not bool(getattr(env.cfg.commands, "heading_command", False)):
+        return 0, int(env.num_envs)
+    return int(getattr(env, "roughflat_start_idx", 0)), int(env.num_envs)
+
+
+def disable_heading_command(env):
+    """Hand the yaw-rate command back to the caller.
+
+    Open-loop yaw calibration needs the commanded yaw rate to actually reach
+    the policy; with heading mode on it never does.  Returns the previous
+    setting so a caller can record what it changed.
+    """
+    prev = bool(getattr(env.cfg.commands, "heading_command", False))
+    env.cfg.commands.heading_command = False
+    return prev
+
+
 def check_run_exists(log_root, load_run):
     """Fail early, and say what *is* there.
 

@@ -268,6 +268,52 @@ def test_replica_is_kept_out_of_the_yaw_contrast(tmp):
           "base centre" in A.table(rows, unf, measured_ref()))
 
 
+def test_heading_control_coverage_is_terrain_dependent():
+    """A yaw command written on flat ground is discarded; in the corridor it is not.
+
+    `_post_physics_step_callback` recomputes `commands[:, 2]` from the heading
+    error for envs `[:roughflat_start_idx]`, and that bound is
+    `ceil(num_envs * sum(terrain_proportions[:9]))`.  Flat ground puts all of
+    its mass in proportion 0, so the bound is num_envs and every env is
+    covered; the corridor puts its mass in proportion 10, so the bound is 0
+    and none are.  The command-response calibration runs on flat ground, so
+    it measured a yaw tracking gain of zero no matter what the policy could
+    do -- while the sweep it was meant to inform was never affected.
+    """
+    import math as _math
+    from safeloco_eval import eval_common as EC
+
+    class FakeCommands(object):
+        def __init__(self, heading):
+            self.heading_command = heading
+
+    class FakeCfg(object):
+        def __init__(self, heading):
+            self.commands = FakeCommands(heading)
+
+    class FakeEnv(object):
+        def __init__(self, terrain, n=250, heading=True):
+            props = EC.TERRAIN_PROPORTIONS[terrain]
+            self.num_envs = n
+            self.cfg = FakeCfg(heading)
+            self.roughflat_start_idx = _math.ceil(n * sum(props[:9]))
+
+    flat = FakeEnv("flat")
+    corridor = FakeEnv("corridor")
+    check("flat ground: heading control covers every env",
+          EC.heading_control_coverage(flat) == (250, 250),
+          "got %r" % (EC.heading_control_coverage(flat),))
+    check("corridor: heading control covers no env",
+          EC.heading_control_coverage(corridor) == (0, 250),
+          "got %r" % (EC.heading_control_coverage(corridor),))
+    check("with heading mode off, nothing is covered anywhere",
+          EC.heading_control_coverage(FakeEnv("flat", heading=False)) == (0, 250))
+    prev = EC.disable_heading_command(flat)
+    check("disabling reports the previous setting", prev is True)
+    check("disabling actually clears the flag",
+          EC.heading_control_coverage(flat) == (0, 250))
+
+
 def test_steer_brake_split_is_a_share():
     recs = make_records(5, 0.1, 0.0, 29.0, 0.15, 2.0, True,
                         activation_frac=0.3, steer_share=0.3)
@@ -474,6 +520,7 @@ def main():
         print("\n[registered predictions]")
         test_predictions_are_computed(tmp)
         test_replica_is_kept_out_of_the_yaw_contrast(tmp)
+        test_heading_control_coverage_is_terrain_dependent()
         test_steer_brake_split_is_a_share()
         print("\n[reference rows]")
         test_fallback_reference_is_announced(tmp)

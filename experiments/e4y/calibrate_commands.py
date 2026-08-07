@@ -79,21 +79,33 @@ def measure(env, policy, rt, axis, value, vx, hold_steps, settle_steps):
     obs, _, _ = env.reset()
     rt.reset(obs)
     acc = {"yaw": [], "vy": [], "vx": []}
+    survived = []
     for t in range(settle_steps + hold_steps):
         rt.maybe_update_world_model()
         # The command buffer is re-randomised on reset; re-pin every step.
         env.commands[:, 0] = vx
         env.commands[:, 1] = value if axis == "vy" else 0.0
         env.commands[:, 2] = value if axis == "omega" else 0.0
+        # The policy reads the command out of the observation, so refresh it
+        # after writing rather than letting the policy act on last step's.
+        env.compute_observations()
+        obs = env.obs_buf
         with torch.no_grad():
             a = policy(obs.detach(), rt.history().detach(),
                        rt.wm_feature.detach(), grid=rt.occ_grid)
         obs, _, _, _, _, _, _ = env.step(a.detach())
         if t >= settle_steps:
+            # Did the command we wrote survive the step, or did something in
+            # the env overwrite it? A gain of zero means nothing about the
+            # policy if the command never reached it.
+            col = 2 if axis == "omega" else 1
+            survived.append(float((env.commands[:, col] - value).abs().mean()))
             acc["yaw"].append(float(env.base_ang_vel[:, 2].mean()))
             acc["vy"].append(float(env.base_lin_vel[:, 1].mean()))
             acc["vx"].append(float(env.base_lin_vel[:, 0].mean()))
-    return {k: (sum(v) / len(v) if v else float("nan")) for k, v in acc.items()}
+    out = {k: (sum(v) / len(v) if v else float("nan")) for k, v in acc.items()}
+    out["cmd_drift"] = (sum(survived) / len(survived)) if survived else 0.0
+    return out
 
 
 def fit_gain(points, axis):
@@ -115,6 +127,23 @@ def main():
 
     env, runner, policy, env_cfg, _, resume_path = EC.build_env_and_policy(
         args, "flat", ARGS.eval_envs, dr_mode="off")
+
+    # The yaw-rate command has to actually reach the policy, and by default it
+    # does not.  With `heading_command = True` the env recomputes
+    # `commands[:, 2]` every step from the heading error, discarding whatever
+    # was written there.  How many envs that covers depends on the terrain --
+    # `[:roughflat_start_idx]`, which is all of them on flat ground and none
+    # of them in the corridor.  So an open-loop sweep on flat ground measures
+    # a yaw tracking gain of zero regardless of what the policy can do, while
+    # the corridor sweep this calibration is meant to inform is unaffected.
+    covered, total = EC.heading_control_coverage(env)
+    heading_was_on = EC.disable_heading_command(env)
+    if heading_was_on:
+        print("[calib] heading_command was ON and covered {}/{} envs on this "
+              "terrain; disabled for the sweep so the commanded yaw rate "
+              "reaches the policy. The corridor sweep is unaffected either "
+              "way -- there its coverage is 0.".format(covered, total))
+
     rt = EC.PolicyRuntime(env, runner)
 
     dt = float(env.dt)
@@ -122,16 +151,21 @@ def main():
     settle = int(ARGS.settle_s / dt)
 
     results = {"omega": [], "vy": []}
+    drift = 0.0
     for w in ARGS.omega_setpoints:
         m = measure(env, policy, rt, "omega", w, ARGS.vx, hold, settle)
-        results["omega"].append({"cmd": w, "yaw": m["yaw"], "vx": m["vx"]})
-        print("  omega cmd %+.2f -> realised %+.3f rad/s  (vx %.3f)"
-              % (w, m["yaw"], m["vx"]))
+        results["omega"].append({"cmd": w, "yaw": m["yaw"], "vx": m["vx"],
+                                 "cmd_drift": m["cmd_drift"]})
+        drift = max(drift, m["cmd_drift"])
+        print("  omega cmd %+.2f -> realised %+.3f rad/s  (vx %.3f, cmd drift "
+              "%.4f)" % (w, m["yaw"], m["vx"], m["cmd_drift"]))
     for vy in ARGS.vy_setpoints:
         m = measure(env, policy, rt, "vy", vy, ARGS.vx, hold, settle)
-        results["vy"].append({"cmd": vy, "vy": m["vy"], "vx": m["vx"]})
-        print("  v_y   cmd %+.2f -> realised %+.3f m/s    (vx %.3f)"
-              % (vy, m["vy"], m["vx"]))
+        results["vy"].append({"cmd": vy, "vy": m["vy"], "vx": m["vx"],
+                              "cmd_drift": m["cmd_drift"]})
+        drift = max(drift, m["cmd_drift"])
+        print("  v_y   cmd %+.2f -> realised %+.3f m/s    (vx %.3f, cmd drift "
+              "%.4f)" % (vy, m["vy"], m["vx"], m["cmd_drift"]))
 
     gain_w = fit_gain(results["omega"], "yaw")
     gain_vy = fit_gain(results["vy"], "vy")
@@ -157,12 +191,29 @@ def main():
         "checkpoint": resume_path,
         "git_commit": EC.git_commit(),
     }
+    blob["heading_command_was_on"] = heading_was_on
+    blob["heading_control_covered_envs"] = covered
+    blob["max_cmd_drift"] = drift
     # A gain near 1 up to a clear saturation point means the filter's commands
     # are real; a gain near 0 means it is issuing instructions into the void.
-    blob["verdict"] = (
-        "yaw tracking usable" if gain_w > 0.5 else
-        "yaw tracking degenerate -- E4-Y tests retrofitting onto this policy, "
-        "not the steering mechanism in its native setting")
+    #
+    # But a gain near 0 also results from the command never arriving, and the
+    # two must not be confused: one is a property of the policy, the other a
+    # bug in the measurement. `cmd_drift` is how far the command had moved by
+    # the end of each step, so a large value means something overwrote it and
+    # the gain says nothing about the policy at all.
+    if drift > 1e-3:
+        blob["verdict"] = (
+            "MEASUREMENT INVALID -- the commanded setpoint did not survive the "
+            "step (mean drift {:.4f}). Something in the env is overwriting "
+            "the command, so this sweep says nothing about what the policy "
+            "can track. Do not read a low gain as a policy limitation."
+            .format(drift))
+    else:
+        blob["verdict"] = (
+            "yaw tracking usable" if gain_w > 0.5 else
+            "yaw tracking degenerate -- E4-Y tests retrofitting onto this "
+            "policy, not the steering mechanism in its native setting")
 
     with open(ARGS.out, "w") as fh:
         json.dump(blob, fh, indent=2)
@@ -175,6 +226,9 @@ def main():
     print("min turn radius @%.1f m/s: %.2f m   vs corridor width %.1f m"
           % (ARGS.vx, turn_r, ARGS.corridor_width))
     print("steering possible here  : %s" % blob["steering_geometrically_possible"])
+    print("command drift (max)     : %.5f   %s" % (
+        drift, "OK -- the setpoint survived each step" if drift <= 1e-3
+        else "*** the setpoint was OVERWRITTEN; gain is meaningless ***"))
     print("VERDICT: %s" % blob["verdict"])
     print("wrote %s" % ARGS.out)
     print("=" * 70)
