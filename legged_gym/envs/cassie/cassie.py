@@ -40,6 +40,14 @@ import torch
 from typing import Tuple, Dict
 from legged_gym.envs import LeggedRobot
 
+try:
+    from safeloco_eval import fall_margin
+except ImportError:  # repo root not on sys.path (bare-script runs)
+    import sys
+    from legged_gym import LEGGED_GYM_ROOT_DIR
+    sys.path.insert(0, LEGGED_GYM_ROOT_DIR)
+    from safeloco_eval import fall_margin
+
 
 class Cassie(LeggedRobot):
     def _init_buffers(self):
@@ -147,6 +155,11 @@ class Cassie(LeggedRobot):
         mesh_type = self.cfg.terrain.mesh_type
         if mesh_type in ['heightfield', 'trimesh']:
             self.terrain = Terrain(self.cfg.terrain, self.num_envs)
+            # TerrainBiped generates no corridor obstacles; _build_obstacle_tensor
+            # (called from the base _create_envs) still expects the attribute.
+            self.corridor_obstacles = getattr(self.terrain, 'corridor_obstacle_info', {})
+        else:
+            self.corridor_obstacles = {}
         if mesh_type=='plane':
             self._create_ground_plane()
         elif mesh_type=='heightfield':
@@ -156,6 +169,76 @@ class Cassie(LeggedRobot):
         elif mesh_type is not None:
             raise ValueError("Terrain mesh type not recognised. Allowed types are [None, plane, heightfield, trimesh]")
         self._create_envs()
+
+    def _compute_safety_value(self):
+        """Fall-safety margin (E5) instead of the quadruped obstacle CBF.
+
+        Runs in post_physics_step immediately before check_termination, on the
+        same refreshed state tensors, so the terminal step of a fall already
+        carries a negative margin -- which is what lets the worst-case safety
+        return recursion propagate the failure backward through the rollout.
+        `min_cbf_h` stays at its 10.0 no-obstacle sentinel.
+        """
+        fs = self.cfg.fall_safety
+
+        if isinstance(self.measured_heights, torch.Tensor) and self.measured_heights.numel() > 0:
+            ground = self.measured_heights.mean(dim=1)
+        else:
+            ground = self.env_origins[:, 2]
+        h_rel = self.root_states[:, 2] - ground
+
+        l_tilt = fall_margin.tilt_margin(self.projected_gravity[:, 2], fs.g_z_thresh)
+        l_height = fall_margin.height_margin(h_rel, fs.h_fall, fs.h_nom)
+
+        illegal = torch.any(
+            torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1)
+            > fs.contact_force_thresh, dim=1)
+        if fs.include_penalised_contacts:
+            illegal |= torch.any(
+                torch.norm(self.contact_forces[:, self.penalised_contact_indices, :], dim=-1)
+                > fs.contact_force_thresh, dim=1)
+        l_contact = fall_margin.contact_margin(illegal)
+
+        dcm = None
+        if fs.mode == 'fail_set_dcm':
+            feet_mid_xy = self.rigid_body_pos[:, self.feet_indices, :2].mean(dim=1)
+            dcm = fall_margin.dcm_margin(
+                self.root_states[:, :2], self.root_states[:, 7:9], h_rel,
+                feet_mid_xy, fs.r_cap, fs.z_c_min, fs.z_c_max)
+
+        self.safety_values, self.fall_margin_min = fall_margin.compose(
+            [l_tilt, l_height, l_contact], dcm, fs.clamp_max)
+
+    def check_termination(self):
+        """Base check_termination with the velocity-error reset gated.
+
+        The base version resets any env whose forward velocity lags its
+        command by 1.5 m/s -- during push-recovery evaluation that censors
+        exactly the episodes we care about (pushed hard, still recoverable),
+        so eval configs set fall_safety.disable_vel_violate = True.  The
+        terminal-state snapshot lines are kept verbatim: metrics.is_fall
+        reads them.
+        """
+        self.term_contact = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
+        self.reset_buf = self.term_contact.clone()
+        vel_error = self.base_lin_vel[:, 0] - self.commands[:, 0]
+        self.vel_violate = ((vel_error > 1.5) & (self.commands[:, 0] < 0.)) | ((vel_error < -1.5) & (self.commands[:, 0] > 0.))
+        self.vel_violate *= (self.terrain_levels > 3)
+
+        self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
+        self.reset_buf |= self.time_out_buf
+        if not self.cfg.fall_safety.disable_vel_violate:
+            self.reset_buf |= self.vel_violate
+
+        self.fall = (self.root_states[:, 9] < -3.) | (self.projected_gravity[:, 2] > 0.)
+        self.reset_buf |= self.fall
+
+        # Terminal-state snapshot for the shared eval module (safeloco_eval).
+        # reset_idx() runs immediately after this and overwrites root_states,
+        # so the fall definition has to read the pose here or not at all.
+        self.term_proj_grav_z = self.projected_gravity[:, 2].clone()
+        self.term_base_z_rel = self.root_states[:, 2] - self.env_origins[:, 2]
+        self.term_base_vel_z = self.root_states[:, 9].clone()
 
     def _reward_lin_vel_z(self):
         # Penalize z axis base linear velocity

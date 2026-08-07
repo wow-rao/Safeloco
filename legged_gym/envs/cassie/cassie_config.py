@@ -170,6 +170,25 @@ class CassieCfg( LeggedRobotCfg ):
         terminate_after_contacts_on = ['pelvis']
         flip_visual_attachments = False
         self_collisions = 1 # 1 to disable, 0 to enable...bitwise filter
+
+    class fall_safety:
+        # Fall-safety margin fed to the reachability pipeline (E5).  Thresholds
+        # mirror safeloco_eval/metrics.py so the margin's zero crossings and
+        # the shared fall definition cannot diverge.
+        mode = 'fail_set'            # 'fail_set' | 'fail_set_dcm'
+        g_z_thresh = -0.5            # = metrics.FALL_TILT_PROJ_GRAV_Z (60 deg)
+        h_fall = 0.15                # = metrics.FALL_HEIGHT [m]
+        h_nom = 0.85                 # nominal pelvis height above ground [m];
+                                     # verify with train_biped.py --probe_steps
+        r_cap = 0.5                  # reachable foothold radius for the DCM term [m]
+        z_c_min = 0.3                # omega0 height clamp [m]
+        z_c_max = 1.2
+        include_penalised_contacts = False  # True adds tarsus/shin to the contact floor
+        contact_force_thresh = 1.0   # [N], matches check_termination
+        clamp_max = 0.5              # matches the rollout-storage safety clamp
+        disable_vel_violate = False  # eval sets True so pushed-but-recovering
+                                     # episodes are not censored by the
+                                     # velocity-error termination
     
     class domain_rand:
         randomize_friction = True
@@ -319,6 +338,27 @@ class CassieCfgPPO(LeggedRobotCfgPPO ):
         vel_predict_coef = 1.0
         num_learning_epochs = 5
         num_mini_batches = 4
+
+        # Safety branch (E5).  Explicitly 0.0: PPO's constructor default is
+        # 0.5, so leaving the field unset silently enables the projection.
+        # Do NOT add safety_coef_min/max here -- those are AMPPPO-only kwargs
+        # and plain PPO would reject them.
+        safety_coef = 0.0
+        safety_value_loss_coef = 1.0
+        # Damping thresholds on the biped fall-margin scale (sv in [-1, 0.5]
+        # on realistic states; -1 is the illegal-contact floor).  The ramp
+        # spans the "wobbling -> falling" band just below zero; widen to
+        # (-0.2, -0.8) if the batch-min statistic saturates during training.
+        d_safe = -0.05
+        d_danger = -0.35
+        # Predictive horizon of the worst-case return recursion: 0.9 reaches
+        # ~30 steps (0.75 s at 40 Hz) -- falls need more lookahead than the
+        # quadruped's obstacle margin (default 0.7).
+        safety_return_alpha = 0.9
+        # Fit the reachability critic on pi_nom/pi_rs rollouts (no policy
+        # influence) so fall-prediction calibration can be evaluated on every
+        # arm; train_biped.py turns this on for the safety_coef == 0 arms.
+        train_safety_critic_when_off = False
         
     class runner( LeggedRobotCfgPPO.runner ):
         run_name = 'parkour'

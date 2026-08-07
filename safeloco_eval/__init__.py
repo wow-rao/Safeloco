@@ -13,6 +13,8 @@ qsafe         the learned joint-space action-value Q_safe and its targets
 eval_common   the evaluation loop, termination definition, episode records
 seeds         the shared 1,000-episode eval seed list
 cli           argument plumbing around IsaacGym's and Dreamer's arg parsers
+fall_margin   the bipedal fall-safety margin (E5) -- torch-only, no IsaacGym
+eval_biped    the E5 biped evaluation loop (push schedule, V_safe logging)
 
 `metrics`, `stats` and `seeds` import nothing beyond the standard library, so
 the analysis and its tests run without a GPU, torch, or IsaacGym.

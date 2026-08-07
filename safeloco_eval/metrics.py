@@ -57,6 +57,12 @@ CONTROL_DT = 0.02
 #: Handoff-attributed falls (E3/J3): a fall this many seconds after a switch.
 HANDOFF_WINDOW_S = 0.5
 
+#: Push-attributed falls (E5): a fall this many seconds after a directed
+#: eval push counts as caused by it.  2 s is several recovery steps -- long
+#: enough to catch a push whose momentum takes a few strides to become a
+#: fall, short enough not to blame a push for an unrelated stumble later.
+PUSH_FALL_WINDOW_S = 2.0
+
 #: Reference values the E1 verdict rule compares against (protocol §3.1).
 OURS_COLLISION_RATE = 0.044
 OURS_RETURN = 33.9
@@ -109,6 +115,21 @@ EPISODE_FIELDS = [
     # --- contact-phase buckets, feeds E6 --------------------------------
     "steps_flight", "steps_partial", "steps_stance",
     "dnorm_flight", "dnorm_partial", "dnorm_stance",
+    # --- E5 biped fall-safety diagnostics (additive only) ----------------
+    # cmd_vx: the pinned forward command; push_mag/push_mode/n_pushes: the
+    # directed-impulse schedule actually applied; fell_within_push_window:
+    # the fall occurred within PUSH_FALL_WINDOW_S of a push (attribution);
+    # steps_to_fall: episode length when the episode fell, else 0 (use
+    # `fell` to distinguish, and report censoring from timeouts alongside);
+    # mean/min_fall_margin: the pure fail-set margin l_fall over the episode;
+    # mean/min_vsafe: the reachability critic's value over the episode;
+    # *_first_neg_step: first step index at which each signal crossed zero,
+    # -1 if it never did -- the per-episode ingredient of the lead-time
+    # comparison (V_safe should cross before the static margin does).
+    "cmd_vx", "push_mag", "push_mode", "n_pushes",
+    "fell_within_push_window", "steps_to_fall",
+    "mean_fall_margin", "min_fall_margin", "mean_vsafe", "min_vsafe",
+    "vsafe_first_neg_step", "margin_first_neg_step",
     # --- provenance ------------------------------------------------------
     "chunk_idx", "env_idx", "terrain_level",
 ]
@@ -247,6 +268,54 @@ def chatter_rate(recs, dt):
     h = sum(int(r["handoffs"]) for r in recs)
     t = sum(int(r["n_steps"]) for r in recs) * dt
     return h / t if t else float("nan")
+
+
+# --------------------------------------------------------------------------
+# E5 biped fall-safety metrics
+# --------------------------------------------------------------------------
+
+def falls_per_1000_steps(recs):
+    """Pooled fall count per 1,000 env-timesteps, as (k, n_thousands).
+
+    The censoring-robust headline rate: a policy that survives to timeout
+    contributes a large denominator and no numerator, while episode-level
+    fall *rate* treats a 100-step fall and a 1000-step survival as one
+    episode each.  Feed through `cluster_bootstrap_rate_ci(recs, ...)` via
+    the raw fields ("fell_count", "n_steps") after `attach_fall_fields`.
+    """
+    k = sum(1 for r in recs if is_fall(r))
+    n = sum(int(r["n_steps"]) for r in recs)
+    return k, n / 1000.0 if n else 0.0
+
+
+def attach_fall_fields(recs):
+    """Derive per-record numerator fields so the cluster bootstrap (which
+    reads record fields, not callables) can resample fall rates."""
+    for r in recs:
+        r["fell_count"] = int(is_fall(r))
+        r["ksteps"] = int(r["n_steps"]) / 1000.0
+    return recs
+
+
+def time_to_fall_values(recs, dt=CONTROL_DT):
+    """Seconds until the fall, over fallen episodes only.
+
+    Returns (values, n_censored): timeout episodes are censored, not falls,
+    so they are excluded from the mean and their count reported alongside --
+    a mean over censored data understates the true time-to-fall.
+    """
+    vals = [int(r["steps_to_fall"]) * dt for r in recs
+            if is_fall(r) and int(r.get("steps_to_fall", 0) or 0) > 0]
+    n_censored = sum(1 for r in recs if not is_fall(r))
+    return vals, n_censored
+
+
+def push_attributed_fall_rate(recs):
+    """Falls within PUSH_FALL_WINDOW_S of a push / episodes pushed, (k, n)."""
+    pushed = [r for r in recs if int(float(r.get("n_pushes", 0) or 0)) > 0]
+    k = sum(1 for r in pushed
+            if int(float(r.get("fell_within_push_window", 0) or 0)))
+    return k, len(pushed)
 
 
 # --------------------------------------------------------------------------
