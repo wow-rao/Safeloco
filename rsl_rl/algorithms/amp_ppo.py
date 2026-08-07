@@ -81,6 +81,8 @@ class AMPPPO:
                  collision_rate_threshold=0.35,
                  collision_rate_ema_span=20,
                  safety_coef_adapt_rate=0.1,
+                 safety_return_alpha=0.7,
+                 train_safety_critic_when_off=False,
                  ):
 
         self.device = device
@@ -130,6 +132,8 @@ class AMPPPO:
         self.safety_value_loss_coef = safety_value_loss_coef
         self.d_safe = d_safe
         self.d_danger = d_danger
+        self.safety_return_alpha = safety_return_alpha
+        self.train_safety_critic_when_off = train_safety_critic_when_off
 
         # Adaptive safety coefficient
         self.adaptive_safety = (safety_coef_min is not None and safety_coef_max is not None)
@@ -236,7 +240,7 @@ class AMPPPO:
         last_safety_values = self.actor_critic.evaluate_safety(
             aug_last_critic_obs, wm_feature, grid=grid
         ).detach()
-        self.storage.compute_safety_returns(last_safety_values)
+        self.storage.compute_safety_returns(last_safety_values, alpha=self.safety_return_alpha)
 
     def update(self):
         mean_value_loss = 0
@@ -387,6 +391,16 @@ class AMPPPO:
                     g_final = g_final * (self.max_grad_norm / g_final_norm)
 
                 write_flat_grads(self.actor_critic, g_final)
+            elif self.train_safety_critic_when_off:
+                # Critic-only regression: the safety head shares no parameters
+                # with the actor, so accumulating this loss on top of the task
+                # gradients leaves the policy update untouched.
+                safety_value_batch = self.actor_critic.evaluate_safety(
+                    aug_critic_obs_batch, wm_feature_batch, grid=grid_batch,
+                    masks=masks_batch, hidden_states=hid_states_batch[1])
+                safety_value_loss = (safety_returns_batch - safety_value_batch).pow(2).mean()
+                safety_loss = self.safety_value_loss_coef * safety_value_loss
+                safety_loss.backward()
 
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
@@ -404,7 +418,7 @@ class AMPPPO:
             mean_grad_pen_loss += grad_pen_loss.item()
             mean_policy_pred += policy_d.mean().item()
             mean_expert_pred += expert_d.mean().item()
-            if self.safety_coef > 0:
+            if self.safety_coef > 0 or self.train_safety_critic_when_off:
                 mean_safety_loss += safety_loss.item()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches

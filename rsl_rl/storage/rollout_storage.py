@@ -171,9 +171,13 @@ class RolloutStorage:
         self.advantages = self.returns - self.values
         self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
 
-    def compute_safety_returns(self, last_safety_critic_value):
-        """Compute safety returns: r(t) = 0.95 * min(sv(t), r(t+1)) + 0.05 * sv(t), clamped <= 0.5."""
-        alpha = 0.7
+    def compute_safety_returns(self, last_safety_critic_value, alpha=0.7):
+        """Compute safety returns: r(t) = alpha * min(sv(t), r(t+1)) + (1 - alpha) * sv(t), clamped <= 0.5.
+
+        alpha sets the effective predictive horizon of the reachability critic
+        (paper Sec. B.3): the worst-case term decays ~alpha^k over k steps, so
+        alpha = 0.7 reaches ~10 steps back while alpha = 0.9 reaches ~30.
+        """
         for step in reversed(range(self.num_transitions_per_env)):
             sv_t = self.safety_values_buf[step]
             if step == self.num_transitions_per_env - 1:

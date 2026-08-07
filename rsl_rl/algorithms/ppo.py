@@ -69,6 +69,8 @@ class PPO:
                  safety_value_loss_coef=1.0,
                  d_safe=DEFAULT_D_SAFE,
                  d_danger=DEFAULT_D_DANGER,
+                 safety_return_alpha=0.7,
+                 train_safety_critic_when_off=False,
                  ):
 
         self.device = device
@@ -102,6 +104,12 @@ class PPO:
         self.safety_value_loss_coef = safety_value_loss_coef
         self.d_safe = d_safe
         self.d_danger = d_danger
+        self.safety_return_alpha = safety_return_alpha
+        # With safety_coef == 0 the safety branch is skipped entirely; this flag
+        # still fits the reachability critic (a parameter-disjoint head) on the
+        # rollouts so V_safe can be used diagnostically without influencing the
+        # policy update.
+        self.train_safety_critic_when_off = train_safety_critic_when_off
 
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, history_dim, wm_feature_dim, grid_shape=None):
         self.storage = RolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, history_dim=history_dim,
@@ -160,7 +168,7 @@ class PPO:
         last_safety_values = self.actor_critic.evaluate_safety(
             aug_last_critic_obs, wm_feature, grid=grid
         ).detach()
-        self.storage.compute_safety_returns(last_safety_values)
+        self.storage.compute_safety_returns(last_safety_values, alpha=self.safety_return_alpha)
 
     def update(self):
         mean_value_loss = 0
@@ -278,6 +286,16 @@ class PPO:
                     g_final = g_final * (self.max_grad_norm / g_final_norm)
 
                 write_flat_grads(self.actor_critic, g_final)
+            elif self.train_safety_critic_when_off:
+                # Critic-only regression: the safety head shares no parameters
+                # with the actor, so accumulating this loss on top of the task
+                # gradients leaves the policy update untouched.
+                safety_value_batch = self.actor_critic.evaluate_safety(
+                    aug_critic_obs_batch, wm_feature_batch, grid=grid_batch,
+                    masks=masks_batch, hidden_states=hid_states_batch[1])
+                safety_value_loss = (safety_returns_batch - safety_value_batch).pow(2).mean()
+                safety_loss = self.safety_value_loss_coef * safety_value_loss
+                safety_loss.backward()
 
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
@@ -287,7 +305,8 @@ class PPO:
 
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
-            mean_safety_loss += safety_loss.item()
+            if self.safety_coef > 0 or self.train_safety_critic_when_off:
+                mean_safety_loss += safety_loss.item()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates

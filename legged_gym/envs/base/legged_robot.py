@@ -248,6 +248,8 @@ class LeggedRobot(BaseTask):
         self.extras["joint_vel"] = self.dof_vel
         self.extras["safety_value"] = self.safety_values
         self.extras["cbf_h_min"] = self.min_cbf_h
+        if hasattr(self, 'fall_margin_min'):
+            self.extras["fall_margin_min"] = self.fall_margin_min
 
         if hasattr(self, 'occ_grid'):
             self.extras["occupancy_grid"] = self.occ_grid.clone()
