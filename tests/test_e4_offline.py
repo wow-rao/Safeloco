@@ -299,6 +299,7 @@ def test_projection():
             self.commands = torch.tensor([[cmd[0], cmd[1], 0.0, 0.0]])
 
     def run(env, alpha, **kw):
+        kw.setdefault("barrier", "sv")   # legacy geometry used by these cases
         f = CBFCommandFilter(alpha=alpha, **kw)
         return f.apply(env.commands, env)
 
@@ -351,6 +352,36 @@ def test_projection():
     _, info = run(env, alpha=0.01, max_passes=1)
     check("unsatisfied constraints are reported as infeasible",
           bool(info["infeasible"][0]))
+
+    # barrier presets: sv demands more clearance than the corridor provides
+    f_sv = CBFCommandFilter(alpha=1.0, barrier="sv")
+    f_geo = CBFCommandFilter(alpha=1.0, barrier="geometric")
+    check("sv barrier demands more than the 0.8 m corridor clearance",
+          f_sv.required_clearance(0.3) > 0.8,
+          "%.2f" % f_sv.required_clearance(0.3))
+    check("geometric barrier is satisfiable in the corridor",
+          f_geo.required_clearance(0.3) < 0.8,
+          "%.2f" % f_geo.required_clearance(0.3))
+    check("geometric barrier measures distance in XY", f_geo.use_xy)
+    check("sv barrier reproduces legged_robot's 2r + 0.35",
+          abs(f_sv.required_clearance(0.3) - (2 * 0.3 + 0.35)) < 1e-9)
+    try:
+        CBFCommandFilter(alpha=1.0, barrier="nonsense")
+    except ValueError:
+        check("unknown barrier preset is rejected", True)
+    else:
+        check("unknown barrier preset is rejected", False)
+
+    # The same geometry is satisfiable under one barrier and not the other.
+    # The forward-only clamp is what makes it bite: without it the filter can
+    # command reverse and satisfy any constraint, which is not the real setup.
+    env = FakeEnv([(0.75, 0.0)])
+    fwd_only = dict(vx_range=(0.0, 0.8), vy_range=(0.0, 0.0))
+    _, i_sv = run(env, alpha=1.0, barrier="sv", **fwd_only)
+    _, i_geo = run(env, alpha=1.0, barrier="geometric", **fwd_only)
+    check("an obstacle at 0.75 m is infeasible under sv but not geometric",
+          bool(i_sv["infeasible"][0]) and not bool(i_geo["infeasible"][0]),
+          "sv=%r geo=%r" % (bool(i_sv["infeasible"][0]), bool(i_geo["infeasible"][0])))
 
     # no obstacles at all
     env = FakeEnv([])

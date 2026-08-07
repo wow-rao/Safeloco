@@ -11,12 +11,6 @@ to acting on the answer if it does work.
 
 ## Why command space is a different problem from E1
 
-Both experiments filter against the same barrier:
-
-```
-h_i = ‖o_i − p‖ − 2 r_i − 0.35          (legged_robot.py:1397)
-```
-
 What differs is *what the filter is allowed to move*.
 
 | | E1 | E4 |
@@ -36,6 +30,35 @@ the CBF condition `ḣ ≥ −α·h` becomes linear in the command:
 with a closed-form projection onto each half-plane and no learned critic
 anywhere. That is why E1's failure says nothing about E4, and why E4 is the
 honest steel-man rather than a straw one.
+
+### Which barrier — this decides the experiment
+
+`legged_robot.py:1397` computes `h = ‖o − p‖₃ − 2·r − 0.35`. That expression
+is a **reward-shaping** term, not a deployment constraint, and using it as a
+hard CBF asks the base to stay **0.95 m** from every obstacle centre. App. G
+puts the corridor's minimum lateral clearance at **0.8 m**, so its safe set is
+*empty* at the tightest points: no command satisfies the constraint, and a
+forward-only robot has nothing to do but stop. The first E4 sweep did exactly
+that — infeasibility 91–100%, forward speed 0.017–0.067 m/s against 0.591
+unfiltered.
+
+So E4 defaults to a barrier that matches what the collision metric actually
+measures — contact when a link comes within `r_obs + 0.03` of the cylinder
+axis in XY:
+
+| preset | `h` | clearance demanded (r = 0.3) | satisfiable in an 0.8 m corridor |
+|---|---|---|---|
+| `geometric` *(default)* | `dist_xy − (r + 0.03 + body_extent)` | 0.53 m | yes |
+| `sv` | `dist₃ − 2r − 0.35` | 0.95 m | **no** |
+
+`body_extent` (default 0.20 m) accounts for links reaching beyond the base the
+barrier is written on; set it with `--body_extent` if you have a better figure
+for the Go1's outer link envelope. Distance is XY because the obstacles are
+vertical cylinders.
+
+Filtering against `sv` is still available with `--barrier sv`, and is worth one
+run as the contrast: it is what a practitioner would get by reusing the
+codebase's existing safety expression, and the answer is that the robot stops.
 
 ### What is deliberately not filtered
 

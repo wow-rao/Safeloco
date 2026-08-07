@@ -44,9 +44,30 @@ import torch
 # ||da|| above which a step counts as filtered (§1 "Activation %").
 ACTIVATION_CMD_THRESH = 1e-6
 
-# legged_robot.py:1397 -- kept in sync deliberately, since filtering against a
-# different barrier than the one the metrics report would be meaningless.
+# --------------------------------------------------------------------------
+# Barrier presets
+# --------------------------------------------------------------------------
+#
+# `sv` reproduces legged_robot.py:1397 exactly: h = dist_3d - 2*r - 0.35.
+# That expression is a *reward-shaping* signal, not a deployment constraint,
+# and as a hard CBF it demands the base stay 0.95 m from every obstacle
+# centre -- more than the corridor's 0.8 m minimum lateral clearance (App. G),
+# so its safe set is empty at the tightest points and no command satisfies it.
+#
+# `geometric` matches what the collision metric actually measures: contact
+# when any link comes within r_obs + BODY_COLLISION_TOL of the cylinder axis
+# in XY.  Distance is taken in XY because the obstacles are vertical
+# cylinders, and `body_extent` accounts for links reaching beyond the base
+# the barrier is written on.
 CBF_BODY_RADIUS_MARGIN = 0.35
+BODY_COLLISION_TOL = 0.03
+DEFAULT_BODY_EXTENT = 0.20        # Go1 base-to-outer-link, approximate
+
+BARRIER_PRESETS = {
+    # name:        (radius_mult, body_margin,                    use_xy)
+    "sv":          (2.0, CBF_BODY_RADIUS_MARGIN,                 False),
+    "geometric":   (1.0, BODY_COLLISION_TOL + DEFAULT_BODY_EXTENT, True),
+}
 
 
 class CommandStepInfo(dict):
@@ -99,21 +120,36 @@ class CBFCommandFilter(CommandFilter):
     name = "cbf_command"
 
     def __init__(self, alpha, max_passes=12, vx_range=None, vy_range=None,
-                 body_margin=CBF_BODY_RADIUS_MARGIN):
+                 barrier="geometric", radius_mult=None, body_margin=None,
+                 use_xy=None):
         self.alpha = float(alpha)
         self.max_passes = int(max_passes)
         self.vx_range = vx_range
         self.vy_range = vy_range
-        self.body_margin = float(body_margin)
+        if barrier not in BARRIER_PRESETS:
+            raise ValueError("unknown barrier preset: {}".format(barrier))
+        rm, bm, xy = BARRIER_PRESETS[barrier]
+        self.barrier = barrier
+        self.radius_mult = float(rm if radius_mult is None else radius_mult)
+        self.body_margin = float(bm if body_margin is None else body_margin)
+        self.use_xy = bool(xy if use_xy is None else use_xy)
+
+    def required_clearance(self, r_obs):
+        """Centre-to-centre distance the barrier insists on, for reporting."""
+        return self.radius_mult * float(r_obs) + self.body_margin
 
     # -- barrier ---------------------------------------------------------
     def _constraints(self, env):
         """(a, b, mask, min_h) with a: [B, N, 2] body-frame, b: [B, N]."""
         p = env.root_states[:, :3]
         delta = env.obstacle_positions - p.unsqueeze(1)          # [B, N, 3]
-        dist = torch.norm(delta, dim=-1)
-        h = dist - 2.0 * env.obstacle_radii.unsqueeze(-1) - self.body_margin
-        d = delta / (dist.unsqueeze(-1) + 1e-8)
+        # Obstacles are vertical cylinders, so the barrier that corresponds to
+        # the collision test is a distance to the *axis*, in XY.
+        dist = (torch.norm(delta[..., :2], dim=-1) if self.use_xy
+                else torch.norm(delta, dim=-1))
+        h = (dist - self.radius_mult * env.obstacle_radii.unsqueeze(-1)
+             - self.body_margin)
+        d = delta / (torch.norm(delta, dim=-1).unsqueeze(-1) + 1e-8)
 
         # Body-frame constraint normal: a = R(psi)^T d_xy.  Recovering yaw
         # from the quaternion keeps this independent of whatever heading
@@ -194,10 +230,12 @@ class CBFCommandFilter(CommandFilter):
 
 
 def build_command_filter(variant, alpha=1.0, vx_range=None, vy_range=None,
-                         max_passes=12):
+                         max_passes=12, barrier="geometric",
+                         body_margin=None):
     if variant in ("none", "unfiltered", None):
         return NoCommandFilter()
     if variant in ("cbf", "cbf_command", "A"):
         return CBFCommandFilter(alpha=alpha, max_passes=max_passes,
-                                vx_range=vx_range, vy_range=vy_range)
+                                vx_range=vx_range, vy_range=vy_range,
+                                barrier=barrier, body_margin=body_margin)
     raise ValueError("unknown command filter variant: {}".format(variant))

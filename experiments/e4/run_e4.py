@@ -38,6 +38,16 @@ def build_parser():
                    help="class-K gain in h_dot >= -alpha*h. SMALL alpha is "
                         "MORE conservative (permits only slow approach); "
                         "alpha -> inf recovers the unfiltered policy.")
+    p.add_argument("--barrier", type=str, default="geometric",
+                   choices=["geometric", "sv"],
+                   help="geometric = matches the collision metric (contact "
+                        "when a link is within r_obs + tol of the axis in XY). "
+                        "sv = legged_robot.py's reward-shaping expression, "
+                        "h = dist_3d - 2*r - 0.35, whose safe set is EMPTY in "
+                        "this corridor (0.95 m demanded vs 0.8 m available).")
+    p.add_argument("--body_extent", type=float, default=None,
+                   help="geometric barrier only: how far links reach beyond "
+                        "the base the barrier is written on. Default 0.20 m.")
     p.add_argument("--max_passes", type=int, default=12,
                    help="cyclic-projection passes for the multi-obstacle case")
     p.add_argument("--clamp_commands", action="store_true", default=True,
@@ -111,9 +121,20 @@ def main():
               "filter can only modulate forward speed, not sidestep."
               .format(*vy_range))
 
+    body_margin = None
+    if ARGS.body_extent is not None:
+        from safeloco_eval.command_filters import BODY_COLLISION_TOL
+        body_margin = BODY_COLLISION_TOL + ARGS.body_extent
     cmd_filt = build_command_filter(
         ARGS.filter, alpha=ARGS.alpha, vx_range=vx_range, vy_range=vy_range,
-        max_passes=ARGS.max_passes)
+        max_passes=ARGS.max_passes, barrier=ARGS.barrier,
+        body_margin=body_margin)
+
+    if ARGS.filter != "none":
+        req = cmd_filt.required_clearance(0.3)
+        print("[E4] barrier '{}': demands {:.2f} m centre-to-centre clearance "
+              "(corridor minimum lateral clearance is 0.8 m per App. G)"
+              .format(ARGS.barrier, req))
 
     # E4 never touches the action; the action filter is the identity so the
     # unfiltered action path is bit-identical to E1's reference row.
@@ -146,8 +167,13 @@ def main():
         lateral_authority=(train_vy[1] > train_vy[0]),
         vx_range=list(vx_range) if vx_range else None,
         vy_range=list(vy_range) if vy_range else None,
-        barrier="h = dist - 2*r_obs - 0.35 (legged_robot.py), relative degree 1 "
-                "wrt commanded base velocity",
+        barrier=ARGS.barrier,
+        barrier_radius_mult=getattr(cmd_filt, "radius_mult", None),
+        barrier_body_margin=getattr(cmd_filt, "body_margin", None),
+        barrier_uses_xy=getattr(cmd_filt, "use_xy", None),
+        barrier_required_clearance_at_r0p3=(
+            cmd_filt.required_clearance(0.3)
+            if hasattr(cmd_filt, "required_clearance") else None),
         yaw_filtered=False,
         terrain=ARGS.eval_terrain, dr_mode=ARGS.dr,
         collision_metric=("geometric_link_cylinder"
