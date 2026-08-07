@@ -20,8 +20,8 @@ not "we avoid collisions better", it is about soundness and about what a
 command filter can express at all.  That claim needs the strongest available
 opponent, which is why this makes the baseline stronger on purpose.
 
-The two config fields that matter, and why neither is the obvious one
---------------------------------------------------------------------
+The three config fields that matter, none of them the obvious one
+-----------------------------------------------------------------
 **1. `flat_ang_vel_yaw`, not `ang_vel_yaw`.**  Training runs on
 `terrain_proportions = [0]*9 + [0.2, 0.8]`, so `sum(proportions[:9]) == 0` and
 therefore `roughflat_start_idx == 0`.  Trace `_resample_commands` with that:
@@ -44,6 +44,15 @@ the shipped config, so even with a wide command range there is no gradient
 pushing the policy to follow it.  Widening the range without this would
 produce a policy that ignores yaw exactly as before, having burned the GPU
 time to find out.
+
+**3. `safety_coef` defaults to 0.1, i.e. ON.**  This one is not about yaw at
+all, and it is the easiest to miss because nothing in this script's purpose
+points at it.  `train_policy.py` zeroes it for pi_nom and pi_rs; a script that
+simply does not mention it inherits 0.1 and trains the yaw-capable analogue of
+**pi_ours**.  Layering a command filter on a policy that already carries the
+paper's safety mechanism measures nothing about command filtering.  `min` and
+`max` are pinned alongside it, or the adaptive schedule brings it back
+mid-run.
 
 This writes to its own run directory and does not touch `pi_nom`.  Every
 completed study shares that baseline; a policy with different command ranges
@@ -91,6 +100,11 @@ def build_parser():
                    help="matches pi_nom/pi_rs so returns stay comparable")
     p.add_argument("--yaw_range", type=float, nargs=2, default=YAW_RANGE)
     p.add_argument("--tracking_ang_vel", type=float, default=TRACKING_ANG_VEL)
+    p.add_argument("--safety_coef", type=float, default=0.0,
+                   help="0 = task-only, matching pi_nom. The shipped config "
+                        "defaults this to 0.1, so leaving it alone trains the "
+                        "analogue of pi_ours instead and the comparison is "
+                        "meaningless. Set non-zero only on purpose.")
     return p
 
 
@@ -105,27 +119,41 @@ from legged_gym import LEGGED_GYM_ROOT_DIR  # noqa: E402
 from safeloco_eval import eval_common as EC  # noqa: E402
 
 
-def apply_yaw_config(env_cfg):
-    """Widen the yaw command range and switch its reward back on.
+def apply_yaw_config(env_cfg, train_cfg):
+    """Widen the yaw command range, switch its reward on, and zero safety_coef.
 
     Returns what changed, so the run directory records it and a later reader
     does not have to diff configs to find out what this policy is.
+
+    **safety_coef must be zeroed explicitly.**  The shipped config defaults it
+    to 0.1, and `train_policy.py` zeroes it for pi_nom/pi_rs precisely because
+    the default is *on*.  Inheriting the default here would train the
+    yaw-capable analogue of pi_ours -- a policy that already carries the
+    paper's safety mechanism -- and layering a command filter on that measures
+    nothing about command filtering.  min and max are pinned too, or the
+    adaptive schedule reintroduces the coefficient mid-run.
     """
     rng = env_cfg.commands.ranges
     before = {
         "ang_vel_yaw": list(getattr(rng, "ang_vel_yaw", [])),
         "flat_ang_vel_yaw": list(getattr(rng, "flat_ang_vel_yaw", [])),
         "tracking_ang_vel": float(env_cfg.rewards.scales.tracking_ang_vel),
+        "safety_coef": float(getattr(train_cfg.algorithm, "safety_coef", 0.0)),
     }
     lo, hi = float(ARGS.yaw_range[0]), float(ARGS.yaw_range[1])
     rng.ang_vel_yaw = [lo, hi]           # dead config here, set for clarity
     rng.flat_ang_vel_yaw = [lo, hi]      # the one that actually governs
     env_cfg.rewards.scales.tracking_ang_vel = float(ARGS.tracking_ang_vel)
 
+    train_cfg.algorithm.safety_coef = ARGS.safety_coef
+    train_cfg.algorithm.safety_coef_min = ARGS.safety_coef
+    train_cfg.algorithm.safety_coef_max = ARGS.safety_coef
+
     after = {
         "ang_vel_yaw": [lo, hi],
         "flat_ang_vel_yaw": [lo, hi],
         "tracking_ang_vel": float(ARGS.tracking_ang_vel),
+        "safety_coef": float(ARGS.safety_coef),
     }
     return {"before": before, "after": after}
 
@@ -141,7 +169,7 @@ def main():
     train_cfg.runner.save_interval = 500
     train_cfg.runner.max_iterations = ARGS.max_iterations
 
-    delta = apply_yaw_config(env_cfg)
+    delta = apply_yaw_config(env_cfg, train_cfg)
 
     # Which envs the flat resample branch covers decides whether any of the
     # above has an effect at all.  Record it rather than trusting the trace.
@@ -167,6 +195,7 @@ def main():
         terrain_proportions=props,
         yaw_governed_by_flat_branch=governed_by_flat_branch,
         heading_command=bool(env_cfg.commands.heading_command),
+        safety_coef=float(train_cfg.algorithm.safety_coef),
         reward_scales=class_to_dict(env_cfg.rewards.scales),
         purpose=("yaw-capable baseline for the command-filtering study; "
                  "pi_nom cannot turn (measured tracking gain 0.015) so the "
@@ -178,7 +207,8 @@ def main():
 
     print("=" * 70)
     print("training a yaw-capable policy  ->  {}".format(log_dir))
-    for k in ("ang_vel_yaw", "flat_ang_vel_yaw", "tracking_ang_vel"):
+    for k in ("ang_vel_yaw", "flat_ang_vel_yaw", "tracking_ang_vel",
+              "safety_coef"):
         print("  {:<18} {} -> {}".format(k, delta["before"][k],
                                          delta["after"][k]))
     if governed_by_flat_branch:
@@ -190,6 +220,13 @@ def main():
               "heading control overwrites yaw for the first block. Both "
               "ranges are set, but check _resample_commands before trusting "
               "this run.")
+    if float(train_cfg.algorithm.safety_coef) != 0.0:
+        print("  *** safety_coef is {}, NOT 0. This is the pi_ours-style "
+              "policy, not a task-only baseline. Intended? ***"
+              .format(train_cfg.algorithm.safety_coef))
+    else:
+        print("  safety_coef 0.0 -- task-only, matching pi_nom "
+              "(config default is 0.1 and must be overridden)")
     print("=" * 70)
 
     runner.learn(num_learning_iterations=train_cfg.runner.max_iterations,

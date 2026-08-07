@@ -186,9 +186,11 @@ makes the baseline stronger on purpose.
 |---|---|---|
 | `flat_ang_vel_yaw` | `[-0.01, 0.01]` | **the range that actually governs.** Training uses `terrain_proportions = [0]*9 + [0.2, 0.8]`, so `sum(proportions[:9]) = 0` and `roughflat_start_idx = 0`. In `_resample_commands`, `heading_command = True` means the branch sampling `ang_vel_yaw` never runs, while `flat_env_ids = env_ids[env_ids >= 0]` selects *every* env. Heading control then covers `[:0]` = nobody, so nothing overwrites it. |
 | `tracking_ang_vel` | `0.0` | the yaw-tracking reward is switched off, so a wide range alone gives no gradient to follow it. |
+| `safety_coef` | **`0.1` — on** | nothing to do with yaw, and the easiest to miss. `train_policy.py` zeroes it for `pi_nom`/`pi_rs`; inherit the default and you train the yaw-capable analogue of **`pi_ours`**, so the command filter sits on a policy that already has the paper's safety mechanism. `min`/`max` are pinned too or the adaptive schedule restores it mid-run. |
 
 Widening `ang_vel_yaw` — the field anyone would reach for first — changes
-nothing at all. Both are set, the dead one for clarity.
+nothing at all. Both are set, the dead one for clarity. The run prints its
+`safety_coef` on startup and says loudly when it is non-zero.
 
 ```bash
 python experiments/e4y/train_yaw_policy.py --task go1_amp --headless \
