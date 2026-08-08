@@ -83,10 +83,34 @@ class GO1AMPCfg(LeggedRobotCfg):
         terrain_width = 8.
         num_rows = 10  # number of terrain rows (levels)
         num_cols = 20  # number of terrain cols (types)
-        # terrain types: [wave, rough slope, stairs up, stairs down, discrete, gap, pit, tilt, crawl, rough_flat, corridor]
+        # terrain types: [wave, rough slope, stairs up, stairs down, discrete, gap, pit, tilt, crawl, rough_flat, corridor, scattered, step_trap]
+        # The shipped proportions are unchanged (corridor training); the
+        # step-trap terrain (slot 12) is opted into by the etrap experiment
+        # scripts, which override terrain_proportions with a 13-entry list.
         terrain_proportions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2, 0.8]
         # trimesh only:
         slope_treshold = 0.75  # slopes above this threshold will be corrected to vertical surfaces
+
+        class step_trap:
+            """Geometry of the step-trap pen (terrain slot 12).
+
+            A closed pen around the spawn: three 0.4 m walls (un-steppable,
+            base-height -- nothing crosses them) and one low sill ahead in
+            the commanded direction, 0.08 -> 0.16 m over the difficulty
+            rows.  Projected to the plane the pen is a closed ring, so any
+            body-level (2-D) controller is stuck inside by construction;
+            only a controller whose safety margin is volumetric (see
+            `lvalue` below) can admit the step-over exit.  Defaults mirror
+            `legged_gym/utils/step_trap.py`.
+            """
+            inner_half = 1.7          # pen interior half-extent [m]; spawn noise is +-1 m
+            wall_thickness = 0.2      # [m]
+            tall_wall_height = 0.4    # un-steppable and >= base height [m]
+            gate_height_min = 0.08    # sill at difficulty 0 (~ natural swing apex) [m]
+            gate_height_max = 0.16    # sill at difficulty 1 (~ 2x natural apex) [m]
+            ring_spacing = 0.24       # 2-D point-ring sample spacing [m]
+            ring_radius = 0.16        # covers thickness/2 and spacing/2: no gap
+            include_next_cell_walls = True  # borrow the next row's walls into the l-value boxes
 
     class init_state(LeggedRobotCfg.init_state):
         pos = [0.0, 0.0, 0.42]  # x,y,z [m] to be checked
@@ -262,6 +286,33 @@ class GO1AMPCfg(LeggedRobotCfg):
             cheat = -1
             stuck = -1
 
+
+    class lvalue:
+        """Custom l-value for box (step-over) obstacles -- go1_amp only.
+
+        The paper instantiates the safety margin l(s) twice: joint limits
+        (Eq. 16) and the planar collision margin l = h + alpha_h * h_dot
+        (Eq. 17, `_compute_safety_value`).  Step-trap cells publish wall
+        *volumes*, and this block parameterizes the third instantiation
+        (`legged_gym/utils/box_sdf.py`):
+
+            l = min over keypoints k, walls B of [ SDF_B(p_k) - margin_k ]
+            sv = l + beta * l_dot,   clamped to <= clamp_max
+
+        SDF is the exact signed distance to the box, so the space above a
+        low sill is inside the safe set: lifting the swing leg over the gate
+        is admissible, while any path over a 0.4 m wall (which the base
+        cannot clear) is not.  This is the property the planar Eq. 17 margin
+        cannot express, and it is what the step-trap experiment measures.
+
+        Inert unless a terrain cell publishes boxes (terrain slot 12).
+        """
+        beta = 0.3          # alpha_h of Eq. 17, kept identical
+        clamp_max = 0.5     # matches the planar sv clamp
+        foot_margin = 0.03  # feet legitimately skim the sill
+        calf_margin = 0.05  # the knee leads a swing leg into a wall first
+        base_margin = 0.10  # trunk half-height plus clearance
+        calf_keypoint_name = 'calf'
 
     class commands:
         curriculum = False

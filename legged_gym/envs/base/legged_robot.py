@@ -51,6 +51,7 @@ from typing import Tuple, Dict
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs.base.base_task import BaseTask
 from legged_gym.utils.terrain import Terrain
+from legged_gym.utils import box_sdf
 from legged_gym.utils.math import quat_apply_yaw, wrap_to_pi, torch_rand_sqrt_float
 from legged_gym.utils.helpers import class_to_dict
 from legged_gym.utils.warp_depth_sensor import DepthCamSensor
@@ -108,6 +109,18 @@ class LeggedRobot(BaseTask):
         self.corridor_end_idx = math.ceil(
             self.cfg.env.num_envs * sum(
                 self.cfg.terrain.terrain_proportions[:min(11, n_props)]
+            )
+        )
+        # step-trap envs (terrain slot 12); empty range unless the config
+        # carries a 13th proportion.
+        self.trap_start_idx = math.ceil(
+            self.cfg.env.num_envs * sum(
+                self.cfg.terrain.terrain_proportions[:min(12, n_props)]
+            )
+        )
+        self.trap_end_idx = math.ceil(
+            self.cfg.env.num_envs * sum(
+                self.cfg.terrain.terrain_proportions[:min(13, n_props)]
             )
         )
 
@@ -1310,18 +1323,59 @@ class LeggedRobot(BaseTask):
         for i in range(len(termination_contact_names)):
             self.termination_contact_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], termination_contact_names[i])
 
+        # Keypoints for the box-obstacle l-value: the calf links lead a swing
+        # leg and strike a sill first.  Robots without a matching link simply
+        # track feet + base.
+        calf_name = self._lvalue_param('calf_keypoint_name', 'calf')
+        calf_names = [s for s in body_names if calf_name in s]
+        self.calf_indices = torch.zeros(len(calf_names), dtype=torch.long, device=self.device, requires_grad=False)
+        for i in range(len(calf_names)):
+            self.calf_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], calf_names[i])
+
         self._build_obstacle_tensor()
+
+    def _lvalue_param(self, name, default):
+        """Read a knob from cfg.lvalue, falling back to box_sdf's defaults.
+
+        Only go1_amp carries the `lvalue` config block; every other robot
+        config resolves to the defaults, so the box l-value stays inert and
+        identically parameterized unless a config opts in.
+        """
+        block = getattr(self.cfg, 'lvalue', None)
+        if block is None:
+            return default
+        return getattr(block, name, default)
 
     def _build_obstacle_tensor(self, env_ids=None):
         """Build padded obstacle tensors for vectorized safety value computation.
 
         Called once at the end of _create_envs and again for specific env_ids
         when terrain curriculum reassigns robots to new terrain cells.
+
+        Two obstacle families share this path.  Cylinder-style point obstacles
+        ("positions"/"radius") feed the planar safety value and every planar
+        consumer (command filters, link_obstacle_collision).  Box volumes
+        ("boxes", published by the step-trap terrain) additionally feed the
+        volumetric l-value; envs that have boxes use ONLY the box l-value --
+        scoring their walls as planar no-go regions is precisely the
+        representation error the step-trap experiment measures.
         """
         if env_ids is None:
             max_obs = 0
+            max_box = 0
             for key, info in self.corridor_obstacles.items():
                 max_obs = max(max_obs, len(info["positions"]))
+                max_box = max(max_box, len(info.get("boxes", [])))
+            self.box_obstacles = torch.zeros(
+                self.num_envs, max(max_box, 1), 6, device=self.device
+            )
+            self.box_obstacle_mask = torch.zeros(
+                self.num_envs, max(max_box, 1), dtype=torch.bool,
+                device=self.device
+            )
+            self.has_box_obstacles = torch.zeros(
+                self.num_envs, dtype=torch.bool, device=self.device
+            )
 
             if max_obs == 0:
                 self.has_obstacles = torch.zeros(
@@ -1368,6 +1422,8 @@ class LeggedRobot(BaseTask):
 
             self.obstacle_mask[idx] = False
             self.has_obstacles[idx] = False
+            self.box_obstacle_mask[idx] = False
+            self.has_box_obstacles[idx] = False
 
             if key not in self.corridor_obstacles:
                 continue
@@ -1383,38 +1439,109 @@ class LeggedRobot(BaseTask):
             self.obstacle_mask[idx, :n_obs] = True
             self.has_obstacles[idx] = True
 
+            boxes = info.get("boxes", None)
+            if boxes is not None and len(boxes) > 0:
+                boxes_t = torch.tensor(
+                    boxes, device=self.device, dtype=torch.float32
+                )
+                n_box = boxes_t.shape[0]
+                # Box centres are cell-local; half-extents are frame-free.
+                boxes_t[:, :3] += env_origin.unsqueeze(0)
+                self.box_obstacles[idx, :n_box] = boxes_t
+                self.box_obstacle_mask[idx, :n_box] = True
+                self.has_box_obstacles[idx] = True
+
     def _compute_safety_value(self):
-        """Vectorized CBF-style safety value: sv = h_dot + h, min over obstacles, clamped <= 0.5."""
-        if not self.has_obstacles.any():
-            self.safety_values[:] = 10.0
-            self.safety_values.clamp_(max=0.5)
-            self.min_cbf_h[:] = 10.0
-            return
+        """Vectorized safety margin l(s), clamped <= 0.5.
 
-        bot_pos = self.root_states[:, :3]
-        bot_vel = self.root_states[:, 7:10]
+        Two instantiations share this hook, selected per env by what its
+        terrain cell published:
 
-        delta = self.obstacle_positions - bot_pos.unsqueeze(1)
-        dist = torch.norm(delta, dim=-1)
-        h = dist - 2.0 * self.obstacle_radii.unsqueeze(-1) - 0.35
-        delta_unit = delta / (dist.unsqueeze(-1) + 1e-8)
-        h_dot = -torch.sum(bot_vel.unsqueeze(1) * delta_unit, dim=-1)
-        sv = 0.3 * h_dot + h
+        * Cylinder-style point obstacles (corridor, scattered): the planar
+          spatial-temporal margin  h = ||o - p|| - 2r - 0.35,
+          sv = 0.3 * h_dot + h  -- unchanged, bit-for-bit.
+        * Box volumes (step trap): the volumetric step-over margin from
+          `legged_gym/utils/box_sdf.py` -- the same sv = 0.3 * l_dot + l
+          form, but with l the signed distance of the robot's keypoints
+          (feet, calves, base) to the wall *volumes*.  The space above a low
+          sill is then inside the safe set, so stepping over it is
+          admissible.  A box env deliberately ignores its planar point
+          representation here: that view exists for the body-level baselines
+          (command filters), and scoring the walls as planar no-go regions
+          would forbid exactly the crossing this terrain exists to elicit.
+        """
+        has_box = getattr(self, 'has_box_obstacles', None)
+        if has_box is None:
+            has_box = torch.zeros_like(self.has_obstacles)
+        cyl_envs = self.has_obstacles & ~has_box
 
-        h_masked = h.masked_fill(~self.obstacle_mask, 1e6)
-        min_h, _ = h_masked.min(dim=-1)
-        self.min_cbf_h = torch.where(
-            self.has_obstacles, min_h,
-            torch.tensor(10.0, device=self.device)
-        )
+        self.safety_values = torch.full(
+            (self.num_envs,), 10.0, device=self.device)
+        self.min_cbf_h = torch.full(
+            (self.num_envs,), 10.0, device=self.device)
 
-        sv = sv.masked_fill(~self.obstacle_mask, 1e6)
-        min_sv, _ = sv.min(dim=-1)
-        min_sv = torch.where(
-            self.has_obstacles, min_sv,
-            torch.tensor(10.0, device=self.device)
-        )
-        self.safety_values = min_sv.clamp(max=0.5)
+        if bool(cyl_envs.any()):
+            bot_pos = self.root_states[:, :3]
+            bot_vel = self.root_states[:, 7:10]
+
+            delta = self.obstacle_positions - bot_pos.unsqueeze(1)
+            dist = torch.norm(delta, dim=-1)
+            h = dist - 2.0 * self.obstacle_radii.unsqueeze(-1) - 0.35
+            delta_unit = delta / (dist.unsqueeze(-1) + 1e-8)
+            h_dot = -torch.sum(bot_vel.unsqueeze(1) * delta_unit, dim=-1)
+            sv = 0.3 * h_dot + h
+
+            h_masked = h.masked_fill(~self.obstacle_mask, 1e6)
+            min_h, _ = h_masked.min(dim=-1)
+            self.min_cbf_h = torch.where(cyl_envs, min_h, self.min_cbf_h)
+
+            sv = sv.masked_fill(~self.obstacle_mask, 1e6)
+            min_sv, _ = sv.min(dim=-1)
+            self.safety_values = torch.where(
+                cyl_envs, min_sv, self.safety_values)
+
+        if bool(has_box.any()):
+            points, vels, margins = self._lvalue_keypoints()
+            sv_box, l_box = box_sdf.box_lvalue(
+                points, vels, margins,
+                self.box_obstacles, self.box_obstacle_mask,
+                beta=self._lvalue_param('beta', box_sdf.BETA),
+                clamp_max=self._lvalue_param('clamp_max', box_sdf.CLAMP_MAX))
+            self.safety_values = torch.where(
+                has_box, sv_box, self.safety_values)
+            self.min_cbf_h = torch.where(has_box, l_box, self.min_cbf_h)
+
+        self.safety_values = self.safety_values.clamp(max=0.5)
+
+    def _lvalue_keypoints(self):
+        """Keypoint positions/velocities/margins for the box l-value.
+
+        Feet carry a tight margin (they legitimately skim the sill), calves a
+        wider one (the knee leads a swing leg into a wall first), the base the
+        widest (half the trunk plus clearance).  Positions and velocities are
+        views on the sim's rigid-body tensor, refreshed every physics step.
+        """
+        parts_pos = [self.rigid_body_pos[:, self.feet_indices]]
+        parts_vel = [self.rigid_body_lin_vel[:, self.feet_indices]]
+        margins = [self._lvalue_param('foot_margin', box_sdf.FOOT_MARGIN)] \
+            * len(self.feet_indices)
+        if len(self.calf_indices) > 0:
+            parts_pos.append(self.rigid_body_pos[:, self.calf_indices])
+            parts_vel.append(self.rigid_body_lin_vel[:, self.calf_indices])
+            margins += [self._lvalue_param('calf_margin',
+                                           box_sdf.CALF_MARGIN)] \
+                * len(self.calf_indices)
+        parts_pos.append(self.root_states[:, :3].unsqueeze(1))
+        parts_vel.append(self.root_states[:, 7:10].unsqueeze(1))
+        margins.append(self._lvalue_param('base_margin', box_sdf.BASE_MARGIN))
+
+        points = torch.cat(parts_pos, dim=1)
+        vels = torch.cat(parts_vel, dim=1)
+        cached = getattr(self, '_lvalue_margins', None)
+        if cached is None or cached.numel() != len(margins):
+            self._lvalue_margins = torch.tensor(
+                margins, device=self.device, dtype=torch.float32)
+        return points, vels, self._lvalue_margins
 
     def _get_env_origins(self):
         """ Sets environment origins. On rough terrain the origins are defined by the terrain platforms.
@@ -1917,10 +2044,16 @@ class LeggedRobot(BaseTask):
     def _reward_cheat(self):
         # penalty cheating to bypass the obstacle
         forward = quat_apply(self.base_quat, self.forward_vec)
-        heading = torch.atan2(forward[:self.roughflat_start_idx, 1], forward[:self.roughflat_start_idx, 0])
+        heading = torch.atan2(forward[:, 1], forward[:, 0])
         cheat = (heading > 1.0) | (heading < -1.0)
         cheat_penalty = torch.zeros(self.num_envs, device=self.device)
-        cheat_penalty[:self.roughflat_start_idx] = cheat
+        cheat_penalty[:self.roughflat_start_idx] = cheat[:self.roughflat_start_idx]
+        # Step-trap envs: with the pen closed, turning away from the gate is
+        # the only alternative to crossing it, so keep the heading forward.
+        # Empty slice (hence a no-op) for every config without terrain slot 12.
+        if self.trap_end_idx > self.trap_start_idx:
+            cheat_penalty[self.trap_start_idx:self.trap_end_idx] = \
+                cheat[self.trap_start_idx:self.trap_end_idx]
         return cheat_penalty
 
     def _reward_feet_edge(self):

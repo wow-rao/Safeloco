@@ -37,6 +37,7 @@ from scipy import interpolate
 import random
 from isaacgym import terrain_utils
 from legged_gym.utils import trimesh
+from legged_gym.utils import step_trap
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
 from scipy.ndimage import binary_dilation
 
@@ -347,10 +348,15 @@ class Terrain:
             terrain_utils.random_uniform_terrain(terrain, min_height=-0.05, max_height=0.05, step=0.005,
                                                  downsampled_scale=0.2)
             self._make_corridor_terrain(terrain, difficulty, i, j)
-        else:
+        elif len(self.proportions) <= 12 or choice < self.proportions[11]:
             terrain_utils.random_uniform_terrain(terrain, min_height=-0.05, max_height=0.05, step=0.005,
                                                  downsampled_scale=0.2)
             self._make_scattered_terrain(terrain, difficulty, i, j)
+        else:
+            # step trap (slot 12): deliberately NO random_uniform floor -- the
+            # sill is 0.08-0.16 m, so +-0.05 m of floor noise would change the
+            # effective gate height by more than half a difficulty band.
+            self._make_step_trap_terrain(terrain, difficulty, i, j)
         return terrain
 
     def _make_corridor_terrain(self, terrain, difficulty, i, j):
@@ -473,6 +479,45 @@ class Terrain:
             "radius": max_radius,
         }
 
+    def _make_step_trap_terrain(self, terrain, difficulty, i, j):
+        """Closed pen of walls; only the low front sill is crossable -- by leg.
+
+        The geometry, its rationale and both published representations (2-D
+        point ring for body-level controllers, 3-D boxes for the l-value) live
+        in `legged_gym/utils/step_trap.py`, which is numpy-only so the offline
+        tests exercise the identical code.  Walls are stamped into the
+        heightfield -- not added as loose trimeshes -- so the depth camera,
+        the privileged height samples and the physics all see the same solid.
+        """
+        cfg = getattr(self.cfg, 'step_trap', None)
+
+        def p(name, default):
+            return getattr(cfg, name, default) if cfg is not None else default
+
+        # Curriculum rows advance along +x, so the cell one row up is this
+        # cell's runway boundary; its walls are borrowed into the l-value
+        # boxes (mesh stays with its own cell).  The last row has no neighbor.
+        has_next_row = (i + 1) < self.cfg.num_rows and p(
+            'include_next_cell_walls', True)
+
+        info = step_trap.build_step_trap(
+            difficulty,
+            inner_half=p('inner_half', step_trap.INNER_HALF),
+            wall_thickness=p('wall_thickness', step_trap.WALL_THICKNESS),
+            tall_wall_height=p('tall_wall_height', step_trap.TALL_WALL_HEIGHT),
+            gate_height_min=p('gate_height_min', step_trap.GATE_HEIGHT_MIN),
+            gate_height_max=p('gate_height_max', step_trap.GATE_HEIGHT_MAX),
+            ring_spacing=p('ring_spacing', step_trap.RING_SPACING),
+            ring_radius=p('ring_radius', step_trap.RING_RADIUS),
+            vertical_scale=self.cfg.vertical_scale,
+            cell_length=self.env_length if has_next_row else None,
+            include_next_cell_walls=has_next_row,
+        )
+        step_trap.rasterize_boxes(
+            terrain.height_field_raw, info["own_boxes"],
+            self.cfg.horizontal_scale, self.cfg.vertical_scale,
+            self.env_length, self.env_width)
+        self.corridor_obstacle_info[(i, j)] = info
 
     def add_terrain_to_map(self, terrain, row, col):
         i = row

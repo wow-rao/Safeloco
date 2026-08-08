@@ -76,6 +76,10 @@ TERRAIN_PROPORTIONS = {
     'tilt':     [0, 0, 0, 0, 0, 0, 0, 1.0, 0, 0],
     'crawl':    [0, 0, 0, 0, 0, 0, 0, 0, 1.0, 0],
     'corridor': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0],
+    # Step trap (slot 12): closed pen with a low sill; like the corridor it
+    # puts zero mass in [:9], so heading control covers no env and the eval
+    # command interface is identical to the corridor's.
+    'step_trap': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0],
 }
 
 
