@@ -123,8 +123,13 @@ def coverage_table(runs):
 
 
 def pivot_table(rows, vx=A.HEADLINE_VX, terrain="flat"):
-    """Fall %% (Wilson CI) by arm x push magnitude -- the headline grid."""
-    sel = [r for r in rows if r["cmd_vx"] == vx and r["terrain"] == terrain]
+    """Fall %% (Wilson CI) by arm x push magnitude -- the headline grid.
+
+    Base cells only: set-mode / custom-dp variant runs share the (arm, mag)
+    key and would silently overwrite the base entry.
+    """
+    sel = [r for r in rows if r["cmd_vx"] == vx and r["terrain"] == terrain
+           and A.is_base_cell(r)]
     if not sel:
         return "<p class='note'>no cells at vx={:g} on {}</p>".format(
             vx, terrain)
@@ -153,14 +158,16 @@ def pivot_table(rows, vx=A.HEADLINE_VX, terrain="flat"):
 def r5a_table(rows):
     cols = [("arm", None), ("cmd_vx", "{:g}"), ("push_mag", "{:g}"),
             ("terrain", None), ("n_eps", "{:d}")]
-    head = ("<tr><th>arm</th><th>vx</th><th>mag</th><th>terrain</th>"
+    head = ("<tr><th>run</th><th>arm</th><th>vx</th><th>mag</th>"
+            "<th>terrain</th>"
             "<th>eps</th><th>fall % (CI)</th><th>falls/1k (CI)</th>"
             "<th>ttf s (n | cens)</th><th>push-attr</th><th>vel err</th>"
             "<th>return</th><th>mean &#8467;</th><th>min &#8467;</th>"
             "<th>mean V<sub>safe</sub></th></tr>")
     body = []
     for r in rows:
-        cells = []
+        cells = ["<td style='text-align:left'>{}</td>".format(
+            esc(r["run_id"]))]
         for key, spec in cols:
             v = r[key]
             cells.append("<td>{}</td>".format(
@@ -307,6 +314,19 @@ def main():
 
     rows = A.table_r5a(runs)
     msgs = A.sanity(runs)
+    arms_early = sorted({r["arm"] for r in rows})
+    trained = training_records(args.train_log_root, set(arms_early))
+    # The eval manifest's vsafe_trained flag is sourced from the *eval-time*
+    # config; the training record is the truth.  Override where it exists.
+    for r in rows:
+        rec = trained.get(r["arm"])
+        if rec is None:
+            rec = next((v for v in trained.values()
+                        if v.get("policy") == r["arm"]), None)
+        if rec is not None:
+            r["vsafe_trained"] = bool(
+                float(rec.get("safety_coef", 0) or 0) > 0
+                or rec.get("train_safety_critic_when_off"))
     calib = {}
     for rid, run in runs.items():
         _, _, mag, _ = A.key_of(run)
@@ -320,8 +340,7 @@ def main():
             calib[rid] = c
     pairs = A.paired_falls(runs, "pi_nom", "pi_ours")
     verdict = A.verdict(rows, calib, pairs)
-    arms = sorted({r["arm"] for r in rows})
-    trained = training_records(args.train_log_root, set(arms))
+    arms = arms_early
 
     sanity_html = ("<ul>" + "".join(
         "<li class='{}'>{}</li>".format(

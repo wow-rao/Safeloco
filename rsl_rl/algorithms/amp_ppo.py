@@ -250,6 +250,8 @@ class AMPPPO:
         mean_policy_pred = 0
         mean_expert_pred = 0
         mean_safety_loss = 0
+        damping_t_sum = 0.0
+        damping_t_n = 0
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
@@ -386,6 +388,13 @@ class AMPPPO:
                     d_safe=self.d_safe, d_danger=self.d_danger)
                 g_final = g_task + self.safety_coef * g_safety_proj
 
+                # Diagnostic: the damping fraction the projection just used
+                # (1 = strict null-space, 0 = raw safety gradient).
+                sv_min = batch_safety_values.min().item()
+                t = (sv_min - self.d_danger) / (self.d_safe - self.d_danger + 1e-12)
+                damping_t_sum += min(max(t, 0.0), 1.0)
+                damping_t_n += 1
+
                 g_final_norm = torch.norm(g_final)
                 if g_final_norm > self.max_grad_norm:
                     g_final = g_final * (self.max_grad_norm / g_final_norm)
@@ -429,6 +438,7 @@ class AMPPPO:
         mean_policy_pred /= num_updates
         mean_expert_pred /= num_updates
         mean_safety_loss /= num_updates
+        self.mean_damping_t = (damping_t_sum / damping_t_n) if damping_t_n else None
         self.storage.clear()
 
         return (mean_value_loss, mean_surrogate_loss, mean_amp_loss,

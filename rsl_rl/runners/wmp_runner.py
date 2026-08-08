@@ -768,6 +768,8 @@ class WMPRunner:
         if hasattr(self.alg, 'd_safe'):
             self.writer.add_scalar('Safety/d_safe', self.alg.d_safe, locs['it'])
             self.writer.add_scalar('Safety/d_danger', self.alg.d_danger, locs['it'])
+        if getattr(self.alg, 'mean_damping_t', None) is not None:
+            self.writer.add_scalar('Safety/damping_t', self.alg.mean_damping_t, locs['it'])
         self.writer.add_scalar('Loss/learning_rate', self.alg.learning_rate, locs['it'])
         if self.cfg['use_amp']:
             self.writer.add_scalar('Loss/AMP', locs['mean_amp_loss'], locs['it'])

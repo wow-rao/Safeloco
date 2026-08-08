@@ -18,6 +18,7 @@ Run the whole grid with experiments/e5/sweep_e5.sh.
 
 import argparse
 import inspect
+import json
 import os
 
 CURDIR = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
@@ -101,6 +102,27 @@ def main():
     seed_list, _ = S.load(ARGS.eval_seed_file)
     records = collector.run(ARGS.n_episodes, seed_list)
 
+    # The checkpoint's own training record is the truth about how the
+    # safety branch was configured -- the eval-time train_cfg reflects the
+    # shipped config defaults, not the trained run.
+    train_record = {}
+    tr_path = os.path.join(os.path.dirname(resume_path), "policy_config.json")
+    if os.path.exists(tr_path):
+        try:
+            with open(tr_path) as f:
+                train_record = json.load(f)
+        except (OSError, ValueError):
+            train_record = {}
+
+    def _trained_field(key, fallback):
+        return train_record[key] if key in train_record else fallback
+
+    trained_safety_coef = float(_trained_field(
+        "safety_coef", train_cfg.algorithm.safety_coef) or 0)
+    trained_critic_when_off = bool(_trained_field(
+        "train_safety_critic_when_off",
+        getattr(train_cfg.algorithm, "train_safety_critic_when_off", False)))
+
     csv_path = os.path.join(ARGS.out_dir, run_id + ".csv")
     EC.write_records(csv_path, records)
     collector.save_calibration(os.path.join(ARGS.out_dir, run_id + ".npz"))
@@ -115,15 +137,12 @@ def main():
         push_seed=ARGS.push_seed,
         fall_safety_mode=env_cfg.fall_safety.mode,
         h_nom=env_cfg.fall_safety.h_nom,
-        safety_coef=train_cfg.algorithm.safety_coef,
-        train_safety_critic_when_off=getattr(
-            train_cfg.algorithm, "train_safety_critic_when_off", False),
-        safety_return_alpha=getattr(
-            train_cfg.algorithm, "safety_return_alpha", 0.7),
-        vsafe_trained=(float(train_cfg.algorithm.safety_coef) > 0
-                       or bool(getattr(train_cfg.algorithm,
-                                       "train_safety_critic_when_off",
-                                       False))),
+        safety_coef=trained_safety_coef,
+        train_safety_critic_when_off=trained_critic_when_off,
+        safety_return_alpha=_trained_field(
+            "safety_return_alpha",
+            getattr(train_cfg.algorithm, "safety_return_alpha", 0.7)),
+        vsafe_trained=(trained_safety_coef > 0 or trained_critic_when_off),
         n_episodes=len(records), eval_envs=ARGS.eval_envs,
         terrain_seed=EC.TERRAIN_SEED,
         control_dt=float(env.dt),

@@ -216,11 +216,16 @@ def test_analyze_e2e():
     try:
         sweep = os.path.join(td, "sweep")
         os.makedirs(sweep)
-        # pi_ours strictly safer than pi_nom, pi_rs between, rates monotone
-        # in magnitude -- the registered-prediction world.
+        # The amended registered-prediction world (arena = stair+push):
+        # pi_ours strictly safer than pi_nom on stairs and at the flat
+        # boundary, pi_rs between, rates monotone in magnitude.
         for arm, base in (("pi_nom", 0.10), ("pi_rs", 0.06), ("pi_ours", 0.02)):
-            for mag in (0.0, 1.0, 2.0):
+            for mag in (0.0, 1.0, 3.0):
                 synth_cell(sweep, arm, mag, fall_rate=base * (1 + 2 * mag))
+        for arm, base in (("pi_nom", 0.15), ("pi_rs", 0.09), ("pi_ours", 0.03)):
+            for mag in (0.0, 1.5):
+                synth_cell(sweep, arm, mag, terrain="stair",
+                           fall_rate=base * (1 + 2 * mag))
         out = os.path.join(td, "R5")
         proc = subprocess.run(
             [sys.executable, os.path.join(ROOT, "experiments", "e5",
@@ -235,10 +240,15 @@ def test_analyze_e2e():
         if os.path.exists(os.path.join(out, "verdict.txt")):
             with open(os.path.join(out, "verdict.txt")) as f:
                 v = f.read()
-            check("analyze_e5: verdict evaluates predictions (i)/(ii)/(iv)",
-                  "(i)" in v and "(ii)" in v and "(iv)" in v, v[:200])
-            check("analyze_e5: pi_rs lands between",
-                  "(ii)  pi_rs between: 2/2" in v, v)
+            check("analyze_e5: verdict evaluates (i)/(ii)/(iv)/(v)",
+                  all(tag in v for tag in ("(i)", "(ii)", "(iv)", "(v)")),
+                  v[:200])
+            check("analyze_e5: (i) holds on the stair+push cell",
+                  "stair+push with separated CIs: 1/1 cells" in v, v)
+            check("analyze_e5: (ii) pi_rs between on stair+push",
+                  "pi_rs between (stair+push): 1/1 cells" in v, v)
+            check("analyze_e5: (v) boundary shift on flat",
+                  "boundary shift on flat at mag >= 2.5: 1/1 cells" in v, v)
     finally:
         shutil.rmtree(td, ignore_errors=True)
 

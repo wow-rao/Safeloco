@@ -80,6 +80,21 @@ def key_of(run):
     return arm, vx, mag, terrain
 
 
+def is_base_cell(r):
+    """True for cells run with the default push mechanics.
+
+    Variant cells (--push_mode set, --push_dp != 150) share an (arm, vx, mag)
+    key with their base cell; anything that groups by that key must exclude
+    them or the variant silently overwrites the base row.
+    """
+    mode = r.get("push_mode", "add") or "add"
+    try:
+        dp = int(float(r.get("push_dp", 150) or 150))
+    except (TypeError, ValueError):
+        dp = 150
+    return mode == "add" and dp == 150
+
+
 # ------------------------------------------------------------- sanity (§5) --
 
 def sanity(runs):
@@ -135,6 +150,8 @@ def table_r5a(runs):
         rows.append({
             "run_id": rid, "arm": arm, "cmd_vx": vx, "push_mag": mag,
             "terrain": terrain, "n_eps": n,
+            "push_mode": run["manifest"].get("push_mode", "add"),
+            "push_dp": run["manifest"].get("push_dp", 150),
             "fall_rate": f_pt, "fall_lo": f_lo, "fall_hi": f_hi,
             "falls_per_1k": r_pt, "f1k_lo": r_lo, "f1k_hi": r_hi,
             "time_to_fall_s": (ST.mean(ttf) if ttf else float("nan")),
@@ -285,47 +302,57 @@ def calibration_for_run(run, dt, horizons_s=CALIB_HORIZONS_S):
 # ------------------------------------------------------------ predictions ---
 
 def verdict(rows, calib, pairs):
-    """The registered predictions (README), applied mechanically."""
+    """The registered predictions, applied mechanically.
+
+    Amended 2026-08-08 after the pi_nom envelope mapping (before any
+    comparison arm was trained): the arena moved from flat+push to
+    stair+push, with the flat magnitude ladder kept as the boundary-shift
+    prediction (v).  Original rules are in git history.
+    """
     lines = []
+    base = [r for r in rows if is_base_cell(r)]
 
-    def cells(arm):
-        return {(r["cmd_vx"], r["push_mag"]): r for r in rows
-                if r["arm"] == arm and r["terrain"] == "flat"}
+    def cells(arm, terrain):
+        return {(r["cmd_vx"], r["push_mag"]): r for r in base
+                if r["arm"] == arm and r["terrain"] == terrain}
 
-    nom, ours, rs = cells("pi_nom"), cells("pi_ours"), cells("pi_rs")
+    nom_s, ours_s, rs_s = (cells("pi_nom", "stair"), cells("pi_ours", "stair"),
+                           cells("pi_rs", "stair"))
+    nom_f, ours_f = cells("pi_nom", "flat"), cells("pi_ours", "flat")
 
-    # (i) pi_ours falls/1k < pi_nom at mag >= 1.0, non-overlapping CIs
+    # (i) stair + push: ours falls/1k < nom with non-overlapping CIs
     checked = held = 0
-    for k in sorted(set(nom) & set(ours)):
+    for k in sorted(set(nom_s) & set(ours_s)):
         vx, mag = k
-        if vx != HEADLINE_VX or mag < PRED_MAG_FLOOR:
+        if mag <= 0:
             continue
         checked += 1
-        a, b = ours[k], nom[k]
+        a, b = ours_s[k], nom_s[k]
         sep = a["f1k_hi"] < b["f1k_lo"]
-        if a["falls_per_1k"] < b["falls_per_1k"] and sep:
+        ok = a["falls_per_1k"] < b["falls_per_1k"] and sep
+        if ok:
             held += 1
-        lines.append("  (i) vx={} mag={}: ours {:.2f} [{:.2f},{:.2f}] vs "
-                     "nom {:.2f} [{:.2f},{:.2f}] -> {}".format(
+        lines.append("  (i) stair vx={} mag={}: ours {:.2f} [{:.2f},{:.2f}] "
+                     "vs nom {:.2f} [{:.2f},{:.2f}] -> {}".format(
                          vx, mag, a["falls_per_1k"], a["f1k_lo"], a["f1k_hi"],
                          b["falls_per_1k"], b["f1k_lo"], b["f1k_hi"],
-                         "HELD" if (a["falls_per_1k"] < b["falls_per_1k"]
-                                    and sep) else "not separated"))
-    lines.insert(0, "(i)   ours < nom with separated CIs at mag >= {}: "
-                 "{}/{} cells".format(PRED_MAG_FLOOR, held, checked))
+                         "HELD" if ok else "not separated"))
+    lines.insert(0, "(i)   ours < nom on stair+push with separated CIs: "
+                 "{}/{} cells".format(held, checked))
 
-    # (ii) pi_rs between
+    # (ii) pi_rs between, on the stair+push cells
     n_between = n_cells = 0
-    for k in sorted(set(nom) & set(ours) & set(rs)):
+    for k in sorted(set(nom_s) & set(ours_s) & set(rs_s)):
         vx, mag = k
-        if vx != HEADLINE_VX or mag < PRED_MAG_FLOOR:
+        if mag <= 0:
             continue
         n_cells += 1
-        lo = min(ours[k]["falls_per_1k"], nom[k]["falls_per_1k"])
-        hi = max(ours[k]["falls_per_1k"], nom[k]["falls_per_1k"])
-        if lo <= rs[k]["falls_per_1k"] <= hi:
+        lo = min(ours_s[k]["falls_per_1k"], nom_s[k]["falls_per_1k"])
+        hi = max(ours_s[k]["falls_per_1k"], nom_s[k]["falls_per_1k"])
+        if lo <= rs_s[k]["falls_per_1k"] <= hi:
             n_between += 1
-    lines.append("(ii)  pi_rs between: {}/{} cells".format(n_between, n_cells))
+    lines.append("(ii)  pi_rs between (stair+push): {}/{} cells".format(
+        n_between, n_cells))
 
     # (iii) calibration: V_safe AUC > margin AUC at H=1 s, positive lead diff
     if calib:
@@ -343,14 +370,37 @@ def verdict(rows, calib, pairs):
     else:
         lines.append("(iii) no npz series found -- calibration not evaluated")
 
-    # (iv) tracking cost at mag 0
+    # (iv) tracking cost at mag 0, on flat AND stair
     k0 = (HEADLINE_VX, 0.0)
-    if k0 in nom and k0 in ours:
-        cost = ours[k0]["vel_err"] - nom[k0]["vel_err"]
-        lines.append("(iv)  tracking cost at mag 0: {:+.3f} m/s (bound {}) "
-                     "-> {}".format(cost, PRED_TRACKING_COST,
-                                    "HELD" if cost < PRED_TRACKING_COST
-                                    else "EXCEEDED"))
+    for terrain, nom_c, ours_c in (("flat", nom_f, ours_f),
+                                   ("stair", nom_s, ours_s)):
+        if k0 in nom_c and k0 in ours_c:
+            cost = ours_c[k0]["vel_err"] - nom_c[k0]["vel_err"]
+            lines.append("(iv)  tracking cost at mag 0 ({}): {:+.3f} m/s "
+                         "(bound {}) -> {}".format(
+                             terrain, cost, PRED_TRACKING_COST,
+                             "HELD" if cost < PRED_TRACKING_COST
+                             else "EXCEEDED"))
+
+    # (v) boundary shift: flat cells at mag >= 2.5, ours < nom separated CIs
+    checked = held = 0
+    for k in sorted(set(nom_f) & set(ours_f)):
+        vx, mag = k
+        if vx != HEADLINE_VX or mag < 2.5:
+            continue
+        checked += 1
+        a, b = ours_f[k], nom_f[k]
+        sep = a["f1k_hi"] < b["f1k_lo"]
+        ok = a["falls_per_1k"] < b["falls_per_1k"] and sep
+        if ok:
+            held += 1
+        lines.append("  (v) flat vx={} mag={}: ours {:.2f} [{:.2f},{:.2f}] "
+                     "vs nom {:.2f} [{:.2f},{:.2f}] -> {}".format(
+                         vx, mag, a["falls_per_1k"], a["f1k_lo"], a["f1k_hi"],
+                         b["falls_per_1k"], b["f1k_lo"], b["f1k_hi"],
+                         "HELD" if ok else "not separated"))
+    lines.append("(v)   boundary shift on flat at mag >= 2.5: {}/{} cells"
+                 .format(held, checked))
 
     if pairs:
         lines.append("paired (McNemar, pi_nom vs pi_ours):")
@@ -376,10 +426,11 @@ def figures(rows, calib, out_dir):
 
     # Fall rate vs push magnitude, per arm (flat, headline vx).
     fig, ax = plt.subplots(figsize=(5, 3.4))
-    arms = sorted({r["arm"] for r in rows})
+    base = [r for r in rows if is_base_cell(r)]
+    arms = sorted({r["arm"] for r in base})
     for arm in arms:
         pts = sorted((r["push_mag"], r["fall_rate"], r["fall_lo"],
-                      r["fall_hi"]) for r in rows
+                      r["fall_hi"]) for r in base
                      if r["arm"] == arm and r["terrain"] == "flat"
                      and r["cmd_vx"] == HEADLINE_VX)
         if not pts:
