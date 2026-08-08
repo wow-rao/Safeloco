@@ -59,6 +59,16 @@ def rec(fell, n_steps=500, n_pushes=0, within=0, steps_to_fall=0, **kw):
 
 # ------------------------------------------------------------- metrics ------
 
+def test_wilson_edges():
+    """Zero-fall and all-fall cells: the interval must contain the point
+    estimate exactly, or matplotlib rejects the derived error bars."""
+    from safeloco_eval import stats as ST
+    for k, n in ((0, 300), (0, 1000), (300, 300), (5, 300)):
+        p, lo, hi = ST.wilson_ci(k, n)
+        check("wilson: lo <= p <= hi at k={}/{}".format(k, n),
+              lo <= p <= hi, (p, lo, hi))
+
+
 def test_metrics():
     recs = [rec(True, n_steps=200, steps_to_fall=200),
             rec(False, n_steps=1000),
@@ -226,6 +236,9 @@ def test_analyze_e2e():
             for mag in (0.0, 1.5):
                 synth_cell(sweep, arm, mag, terrain="stair",
                            fall_rate=base * (1 + 2 * mag))
+        # A zero-fall cell: its Wilson bound used to land an ulp past the
+        # point estimate and crash the falls-vs-push errorbar figure.
+        synth_cell(sweep, "pi_ours", 0.5, fall_rate=0.0)
         out = os.path.join(td, "R5")
         proc = subprocess.run(
             [sys.executable, os.path.join(ROOT, "experiments", "e5",
@@ -249,12 +262,30 @@ def test_analyze_e2e():
                   "pi_rs between (stair+push): 1/1 cells" in v, v)
             check("analyze_e5: (v) boundary shift on flat",
                   "boundary shift on flat at mag >= 2.5: 1/1 cells" in v, v)
+        try:
+            import matplotlib  # noqa: F401
+            has_mpl = True
+        except ImportError:
+            has_mpl = False
+        if has_mpl:
+            proc = subprocess.run(
+                [sys.executable, os.path.join(ROOT, "experiments", "e5",
+                                              "analyze_e5.py"),
+                 "--dir", sweep, "--out", out],
+                capture_output=True, text=True)
+            check("analyze_e5: figure path survives a zero-fall cell",
+                  proc.returncode == 0
+                  and os.path.exists(os.path.join(out, "falls_vs_push.png")),
+                  proc.stderr[-500:] if proc.returncode else "")
+        else:
+            print("  SKIP  figure path (matplotlib not available)")
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
 
 def main():
     print("tests/test_e5_offline.py")
+    test_wilson_edges()
     test_metrics()
     test_push_schedule()
     test_calibration()

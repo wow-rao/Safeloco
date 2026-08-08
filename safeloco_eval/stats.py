@@ -32,7 +32,13 @@ def wilson_ci(k, n, z=Z95):
     denom = 1.0 + z * z / n
     centre = (p + z * z / (2 * n)) / denom
     half = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
-    return (p, max(0.0, centre - half), min(1.0, centre + half))
+    # The Wilson interval contains the sample proportion in exact arithmetic;
+    # at k = 0 (or k = n) floating point can put the bound an ulp on the wrong
+    # side of p, which downstream consumers (matplotlib's yerr validation)
+    # reject.  Clamp the bounds to include p.
+    lo = min(max(0.0, centre - half), p)
+    hi = max(min(1.0, centre + half), p)
+    return (p, lo, hi)
 
 
 def ci_overlap(ci_a, ci_b):

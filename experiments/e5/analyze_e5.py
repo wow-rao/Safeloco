@@ -437,8 +437,11 @@ def figures(rows, calib, out_dir):
             continue
         xs = [p[0] for p in pts]
         ys = [100 * p[1] for p in pts]
-        lo = [100 * (p[1] - p[2]) for p in pts]
-        hi = [100 * (p[3] - p[1]) for p in pts]
+        # max(0, .) guards zero-fall / all-fall cells, where floating point
+        # can put a CI bound an ulp past the point estimate and matplotlib
+        # refuses negative error bars.
+        lo = [max(0.0, 100 * (p[1] - p[2])) for p in pts]
+        hi = [max(0.0, 100 * (p[3] - p[1])) for p in pts]
         ax.errorbar(xs, ys, yerr=[lo, hi], marker="o", capsize=3, label=arm)
     ax.set_xlabel("push magnitude [m/s]")
     ax.set_ylabel("fall rate [% episodes]")
